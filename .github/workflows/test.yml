@@ -1,0 +1,20 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  stub-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Lua
+        run: sudo apt-get update && sudo apt-get install -y lua5.1
+
+      - name: Run the stub-client harness
+        # lua5.1 matches the client's Lua, so 5.1-only breakage cannot hide behind a newer interpreter.
+        run: lua5.1 Tests/wow_stub.lua

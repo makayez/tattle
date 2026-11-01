@@ -1,0 +1,14 @@
+package-as: Snitch
+
+enable-nolib-creation: no
+
+# Development-only files: the stub-client test harness and repo bookkeeping
+# should never ship inside the packaged addon folder.
+ignore:
+  - Tests
+  - FEATURES.md
+  - PROJECT_SUMMARY.md
+  - TESTING.md
+  - UPDATES.md
+  - .github
+  - .gitignore

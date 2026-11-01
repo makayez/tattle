@@ -1,12 +1,14 @@
 ## Interface: 120001, 120000
 ## Title: Snitch
-## Notes: Alerts when group members perform certain actions (SwapBlaster usage, low durability, etc.)
+## Notes: Alerts when a group member uses SwapBlaster, Life Grip, or Rescue
 ## Author: Tarball-Whisperwind [A]
-## Version: 0.1.0
+## Version: 0.1.0-alpha.1
 ## SavedVariables: SnitchDB
 
+EventListener.lua
 Core.lua
 ScreenAlert.lua
 Config.lua
 Modules\SwapBlaster.lua
 Modules\LifeGrip.lua
+Modules\Rescue.lua

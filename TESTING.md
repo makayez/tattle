@@ -2,21 +2,49 @@
 
 ## Installation for Testing
 
-1. Copy or symlink the `snitch` directory to your WoW AddOns folder:
-   ```bash
-   # Create symlink (recommended for development)
-   ln -s ~/projects/wow/snitch "/Applications/World of Warcraft/_retail_/Interface/AddOns/Snitch"
+The addon folder must be named `Snitch` (it has to match `Snitch.toc`).
 
-   # Or copy the directory
-   cp -r ~/projects/wow/snitch "/Applications/World of Warcraft/_retail_/Interface/AddOns/Snitch"
-   ```
+Windows, symlink the project into the AddOns folder so edits apply without re-copying:
 
-2. Launch WoW and log in to a character
+```powershell
+mklink /J "C:\Program Files (x86)\World of Warcraft\_retail_\Interface\AddOns\Snitch" "C:\Users\jon\iCloudDrive\projects\snitch"
+```
 
-3. Verify the addon loaded:
-   ```
-   /snitch version
-   ```
+Or copy it:
+
+```powershell
+xcopy /E /I "C:\Users\jon\iCloudDrive\projects\snitch" "C:\Program Files (x86)\World of Warcraft\_retail_\Interface\AddOns\Snitch"
+```
+
+macOS/Linux:
+
+```bash
+ln -s ~/projects/snitch ~/.wine/drive_c/Program\ Files/World\ of\ Warcraft/_retail_/Interface/AddOns/Snitch
+```
+
+Launch WoW and log in to a character, then verify the addon loaded:
+
+```
+/snitch version
+```
+
+## Run the probe first
+
+Before testing anything else, see what your client actually exposes:
+
+```
+/snitch debug
+/snitch probe
+```
+
+Then use each ability on **yourself** and on **a friend**. The probe prints, for every cast event it sees:
+
+- the spell name (resolved through `C_Spell.GetSpellInfo`, so it works even when the ID is a secret value)
+- whether the caster argument can be named, and whether it is you
+- whether any destination argument is exposed at all
+- which group auras are currently visible
+
+That last line is the important one: "on Donut" in a Life Grip or Rescue alert only works if another player's aura is readable on your client. "none visible" means those alerts fall back to `(target unknown)`.
 
 ## Testing Checklist
 
@@ -29,15 +57,15 @@
 
 ### Module Testing
 
-#### SwapBlaster Detection
+The shipped spell IDs are verified against the live 12.1.5 database, so no ID hunting is needed to start:
 
-Before testing, you need to find the correct spell ID:
+| Module | Spell ID | In-game spell name | Cast |
+| --- | --- | --- | --- |
+| SwapBlaster | `161399` | **Swap** (from item 111820) | 1.5 sec, channeled |
+| Life Grip | `73325` | **Leap of Faith** | instant |
+| Rescue | `370666` | **Rescue** | instant |
 
-1. Enable debug mode: `/snitch debug`
-2. Use the SwapBlaster toy yourself (out of combat)
-3. Check your combat log for the spell ID
-4. Update `SWAPBLASTER_SPELL_IDS` in `Modules/SwapBlaster.lua` with the correct ID
-5. `/reload` to reload the addon
+If `/snitch debug` prints `WARNING: spell ID ... not found`, or the probe shows a different name, enter the correct ID in that module tab's spell ID editor and `/reload`.
 
 **Test Cases:**
 
@@ -45,17 +73,27 @@ Before testing, you need to find the correct spell ID:
    - [ ] Use SwapBlaster while not in a group
    - [ ] Verify no alerts appear (addon only works in groups)
 
-2. **Group Testing (should trigger)**
-   - [ ] Form a party with at least one other player
-   - [ ] Have someone use SwapBlaster
-   - [ ] Verify alert appears when they start casting
-   - [ ] Verify alert appears when cast completes
-   - [ ] Try cancelling the cast (move or jump)
-   - [ ] Verify alert appears for cancelled cast
+2. **SwapBlaster (grouped, out of combat)**
+   - [ ] Have someone start a Swapblaster cast
+   - [ ] Verify the "is casting SwapBlaster" alert fires *during* the 1.5 seconds
+   - [ ] Verify a second alert when it completes
+   - [ ] Cancel the cast mid-channel and verify "was cut short" rather than "used SwapBlaster"
+   - [ ] Verify only one alert per phase even if the client sends both `START` and `CHANNEL_START`
 
-3. **Target Detection**
-   - [ ] Have someone use SwapBlaster on a specific target
-   - [ ] Verify the target name appears in the alert (if possible)
+3. **Life Grip (grouped, out of combat)**
+   - [ ] Have a Priest Leap of Faith you
+   - [ ] Verify `... used Life Grip on you!`
+   - [ ] Have them grip someone else and verify that person is named
+   - [ ] Verify nothing fires for an in-combat grip (that is a legitimate heal)
+
+4. **Rescue (grouped, out of combat)**
+   - [ ] Have an Evoker Rescue you
+   - [ ] Verify `... used Rescue on you!`
+   - [ ] Have them carry someone else and verify the passenger is named, not the Evoker
+
+5. **Target Detection limits**
+   - [ ] Confirm SwapBlaster reports no victim - expected, the spell marks nobody
+   - [ ] If Life Grip or Rescue reports `(target unknown)`, check the probe's aura line for your client
 
 ### Alert Testing
 
@@ -114,10 +152,11 @@ Debug output shows:
 
 ## Known Limitations
 
-1. **Spell ID**: The SwapBlaster spell ID must be verified in-game and may change between expansions
-2. **Group Only**: Alerts only work when in a party or raid group
-3. **Target Detection**: Target detection may not always work depending on combat log events
-4. **Combat Log Timing**: Out-of-combat toy usage may have limited combat log events in current expansion (designed for Midnight)
+1. **No victim for SwapBlaster**: the swap applies no aura to either participant, and 12.0.0 removed `COMBAT_LOG_EVENT_UNFILTERED`, which was the only API that carried a destination. SwapBlaster alerts name the caster only
+2. **Aura-dependent attribution**: Life Grip and Rescue can only be attributed while group auras are readable. 12.1.0 relaxed this out of combat; inside instances it can still be refused
+3. **Group Only**: alerts only work when in a party or raid group, which is also the only way these abilities can be used
+4. **In-combat use is ignored** for Life Grip and Rescue, where pulling someone is a legitimate save
+5. **Secret spell IDs**: inside restricted content the ID cannot be compared directly, so a spell whose *name* changes would need its ID re-entered
 
 ## Troubleshooting
 
@@ -132,11 +171,10 @@ Debug output shows:
 2. Enable debug mode: `/snitch debug`
    - Watch for messages explaining why alerts are blocked
 
-3. Verify spell ID:
-   - Use the toy yourself
-   - Check combat log for spell ID
-   - Update `Modules/SwapBlaster.lua` if needed
-   - `/reload`
+3. Verify spell IDs:
+   - `/snitch probe`, then use the ability
+   - Compare the spell name the probe prints against the module's expected name
+   - Enter the correct ID in that module's spell ID editor and `/reload`
 
 ### Configuration not saving
 

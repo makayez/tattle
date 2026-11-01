@@ -209,22 +209,18 @@ Modules:
 - `ScreenAlert.lua` - No changes needed
 - `Modules/SwapBlaster.lua` - No changes needed (works with new system)
 
-## Spell IDs to Verify
+## Spell IDs
 
-Before testing, verify these spell IDs in-game:
+Verified against the live 12.1.5 spell database, so the checking this file used to ask for is already done:
 
-**Life Grip**: 73325
-- Have a priest check their spellbook
-- Use `/dump C_Spell.GetSpellInfo(73325)`
-- Update `LIFEGRIP_SPELL_IDS` in `Modules/LifeGrip.lua` if needed
+| Ability | Verified ID | What the guess got wrong |
+| --- | --- | --- |
+| Life Grip | `73325` | Correct. Still named "Leap of Faith" in 12.x, instant, 40 yd |
+| SwapBlaster | `161399` | `470116` was wrong: it is an internal test spell ("Chasting Strike"). The cast is a spell named **"Swap"**, 1.5 sec channeled |
+| Neural Silencer | `156779`, `384129` | `470344` was wrong (a hidden test aura, "Supercharged"), and the buff is **Neural** Silencer |
+| Rescue | `370666`, `370667` | New module; `370667` is the passenger-side aura and is a strong candidate rather than a confirmed link |
 
-**SwapBlaster**: 470116 (already in code)
-- Use toy and check combat log
-- Update `SWAPBLASTER_SPELL_IDS` in `Modules/SwapBlaster.lua` if needed
-
-**Neurosilencer**: 470344 (already in code)
-- Find someone with buff active
-- Update `NEUROSILENCER_SPELL_IDS` in `Modules/SwapBlaster.lua` if needed
+`/snitch probe` confirms what your own client exposes. Overrides go in the module tab's spell ID editor, not in code.
 
 ## Summary
 

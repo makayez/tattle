@@ -9,21 +9,22 @@
 - Clean separation of concerns
 
 ### SwapBlaster Detection
-The initial detection module includes:
+The detection module (`Modules/SwapBlaster.lua`, spell `161399`):
 
 1. **Cast Detection**
-   - Alerts when someone starts casting SwapBlaster
+   - Alerts when a group member starts the 1.5 second cast
    - Reports successful casts
-   - Reports cancelled/interrupted casts
+   - Reports a channel that ended early, plus cancelled/interrupted casts
+   - Tracks `UNIT_SPELLCAST_CHANNEL_START` / `_CHANNEL_STOP` as well as `_START` / `_SUCCEEDED`, because the cast is flagged channeled
 
-2. **Target Identification**
-   - Identifies who is being swapped
-   - Shows target name in alerts
+2. **No victim name (a 12.x limit, not a missing feature)**
+   - The swap applies no aura to either participant, and 12.0.0 removed the combat log, which was the only API that reported a destination
+   - So SwapBlaster alerts name the caster only. Life Grip and Rescue *can* name their victim, because those do apply an aura
 
-3. **Neurosilencer Detection**    - Automatically checks if target has Neurosilencer buff
-   - Warns in alert: "(NEUROSILENCER ACTIVE - will block!)"
-   - Helps raid avoid wasted SwapBlaster attempts
-   - Uses efficient aura checking
+3. **Neural Silencer Detection**
+   - Checks the group for the "Neural Silencer" aura (`156779` from the item, `384129` for the craftable Mk3)
+   - Notes in the alert who is wearing one, since it blocks SwapBlaster and Leap of Faith
+   - Uses `C_UnitAuras.GetAuraDataBySpellName`, which 12.1.0 made readable out of combat again
 
 ## Alert System
 
@@ -153,11 +154,11 @@ Access via: `/snitch` command
 ## How It Works
 
 ### Detection Flow
-1. Player in your group uses SwapBlaster
-2. Combat log event fires
-3. Snitch filters event (is it SwapBlaster? is player in group?)
-4. SwapBlaster module processes event
-5. Module checks target for Neurosilencer
+1. Player in your group casts SwapBlaster, Life Grip or Rescue
+2. A unit cast event fires (`COMBAT_LOG_EVENT_UNFILTERED` no longer exists in 12.x)
+3. Snitch filters it (is the spell watched? is the caster in your group? does the scope allow it?)
+4. The module resolves the secret spell ID to a spell name and matches it
+5. For Life Grip and Rescue, the module scans group auras to name the victim
 6. Module formats alert message
 7. Core sends alert to all enabled output methods
 
@@ -176,20 +177,18 @@ Access via: `/snitch` command
 
 ## Setup Requirements
 
-### Finding Spell IDs
+### Spell IDs
 
-**SwapBlaster:**
-1. Enable debug: `/snitch debug`
-2. Use the toy yourself
-3. Check combat log or debug output
-4. Update `SWAPBLASTER_SPELL_IDS` in `Modules/SwapBlaster.lua`
+Verified against the live 12.1.5 spell database:
 
-**Neurosilencer:**
-1. Find someone with the buff
-2. `/dump` their buffs or check combat log
-3. Update `NEUROSILENCER_SPELL_IDS` in `Modules/SwapBlaster.lua`
+| Ability | Spell ID | Notes |
+| --- | --- | --- |
+| Swapblaster's cast | `161399` | Named **"Swap"**, not "SwapBlaster"; 1.5 sec channeled item effect (item 111820). `162217` is the crafting spell and `182081` is the backfire - neither is the cast |
+| Neural Silencer | `156779`, `384129` | "Immune to some annoyances", 12 hours, blocks SwapBlaster and Leap of Faith |
+| Life Grip | `73325` | Still named **"Leap of Faith"**; not renamed in 12.x |
+| Rescue | `370666` | Evoker. `370667` is the matching passenger-side aura (strong candidate, not a confirmed link) |
 
-The addon includes example IDs but these **must be verified** in your game version.
+If a future patch changes an ID, override it in the module tab's spell ID editor - no code edit needed. `/snitch probe` prints what your client actually exposes.
 
 ## Future Module Ideas
 
@@ -241,11 +240,11 @@ snitch/
 
 ## Summary
 
-Snitch is a production-ready, highly customizable addon for monitoring group member actions. The initial SwapBlaster module demonstrates the system's capabilities:
+Snitch is a production-ready, highly customizable addon for monitoring group member actions. The three modules show what the 12.x API still allows:
 
-- Accurate detection via combat log
-- Target identification
-- Neurosilencer buff detection
+- Detection through unit cast events (the combat log is gone in 12.0.0)
+- Victim naming where the spell leaves an aura (Life Grip, Rescue); SwapBlaster leaves none, so it is reported without a victim
+- Neural Silencer awareness
 - Multiple alert methods
 - Fully customizable screen alerts
 - Drag-and-drop positioning

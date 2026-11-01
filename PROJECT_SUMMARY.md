@@ -144,56 +144,55 @@ Snitch:RegisterModule("moduleId", {
 
 ## Known Considerations
 
-### SwapBlaster Spell ID
+### Spell IDs (verified against 12.1.5)
 
-The spell ID for SwapBlaster (currently `470116` in the code) is a placeholder and must be verified in-game:
+`470116` and `470344`, the IDs this project originally guessed, are both wrong: `470116` is an internal test spell ("Chasting Strike") and `470344` is a hidden test aura ("Supercharged"). The verified IDs are `161399` (Swapblaster's cast, named "Swap"), `156779` / `384129` (Neural Silencer), `73325` (Life Grip, still named "Leap of Faith") and `370666` / `370667` (Rescue).
 
-1. Use the toy yourself (out of combat)
-2. Enable debug mode: `/snitch debug`
-3. Check combat log for the actual spell ID
-4. Update `SWAPBLASTER_SPELL_IDS` table in `Modules/SwapBlaster.lua`
-5. `/reload` to apply
+If a patch changes one, override it in the module tab's spell ID editor rather than editing code.
 
-The spell ID may vary by expansion or be different from what's documented online.
+### Event Limitations
 
-### Combat Log Limitations
-
-- Only works when in a party or raid group (by design)
-- Out-of-combat toy usage may have limited combat log events in current expansion
-- Designed with Midnight expansion changes in mind (improved OOC logging)
+- Only works when in a party or raid group (by design: these abilities require a group)
+- `COMBAT_LOG_EVENT_UNFILTERED` was removed in 12.0.0, so detection runs entirely off `UNIT_SPELLCAST_*` events
+- Inside restricted content the spell ID is a secret value: it cannot be compared, printed or used as a key, so spells are matched by the name `C_Spell.GetSpellInfo` returns
 
 ### Target Detection
 
-Target detection is best-effort:
-- Works when target is in combat log event
-- May show "unknown target" if target info not available
-- Limited by what WoW's combat log provides
+Target detection depends entirely on whether the spell marks its victim:
+- Life Grip (4 s "Leap of Faith" aura) and Rescue (3 s "Rescue" aura) are attributed by name, because 12.1.0 made group auras readable out of combat again
+- SwapBlaster marks nobody, so its alerts report the caster only
+- Rescue is instant and Leap of Faith is instant, so no cast-start event precedes them; the completion event must stand alone
 
 ## Adding New Modules
 
 To add a new detection module (e.g., hunter pet detection):
 
 1. Create `Modules/YourModule.lua`
-2. Follow the SwapBlaster.lua pattern:
+2. Follow the Rescue.lua pattern:
    ```lua
-   local MODULE_ID = "yourmodule"
+   local MODULE_ID   = "yourmodule"
    local MODULE_NAME = "Your Module Name"
-   local MODULE_DESCRIPTION = "What it detects"
 
-   -- Detection logic
-   local function OnCombatLogEvent(...)
-       -- Your detection code
-       if condition then
-           Snitch.SendAlert("Message", MODULE_ID)
-       end
+   -- Resolve the watched IDs to names once, at Initialize(); cast events hand
+   -- over secret spell IDs that can only be matched by name.
+   local watchedNames = {}
+
+   local function OnEvent(event, unitToken, castGUID, spellID)
+       local info = C_Spell.GetSpellInfo(spellID)
+       if not info or not watchedNames[info.name] then return end
+       if not Snitch.IsGroupMemberToken(unitToken) then return end
+       if Snitch.ShouldReport(MODULE_ID, unitToken) == false then return end
+
+       Snitch.SendAlert("Message", MODULE_ID)
    end
 
-   -- Register
    Snitch:RegisterModule(MODULE_ID, {
-       name = MODULE_NAME,
-       description = MODULE_DESCRIPTION,
-       onCombatLogEvent = OnCombatLogEvent,
-       initialize = Initialize
+       name        = MODULE_NAME,
+       description = "What it detects",
+       onEvent     = OnEvent,
+       initialize  = Initialize,
+       spellIDs    = { 123456 },
+       events      = { "UNIT_SPELLCAST_SUCCEEDED" },
    })
    ```
 3. Add to `Snitch.toc`
