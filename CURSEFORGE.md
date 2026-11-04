@@ -2,16 +2,23 @@
 Source of the CurseForge project page. Paste the Markdown below into CurseForge's
 description editor (Markdown mode).
 
-Project: CurseForge project 1782380, slug "tattle", game: WoW Retail.
+Project: CurseForge project 1782380, game: WoW Retail. The project is not public
+until the first file is approved by moderation, so the public slug is whatever the
+URL says once it is live - read it from the project page rather than guessing it here.
+
 Fill before publishing:
 
-  * Summary field -> the one-liner below the H1, trimmed to 255 chars
+  * Summary field -> the one-liner below the H1 (255 characters available)
   * Project icon  -> upload Tools/tattle-turtle-512.png
-  * Category      -> Utility / User Interface, Damage Reduction (minor field)
+  * Category      -> Utility, Damage Reduction (minor field)
   * License field -> pick one in the project settings until a LICENSE file exists
 
-The project is not public until the first file is approved by moderation, so the
-public link below is written for the page once it is live.
+For the file itself (packager does all of this automatically once CF_API_TOKEN is a
+repository secret, otherwise upload .release/Tattle-<version>.zip by hand):
+
+  * game version / parent compatibility -> Retail
+  * release type -> Alpha, because the version says alpha
+  * changelog -> the 0.2.0 section of CHANGELOG.md
 -->
 
 # Tattle
