@@ -1,5 +1,20 @@
 # Recent Updates
 
+### 0.2.0-alpha.1 is out
+**Before**: the work since the last tag sat in the tree - the rename, the Neural Silencer
+module, the performance pass, the LFR chat fix, the icon - and there was no CurseForge
+project to put it on
+
+**Now**: tag `v0.2.0-alpha.1` is pushed, and pushing an annotated tag is the whole release
+procedure: `BigWigsMods/packager` builds `Tattle-v0.2.0-alpha.1.zip`, creates the GitHub
+pre-release and - once a CurseForge token exists as a repository secret - uploads to
+CurseForge project 1782380 through `## X-Curse-Project-ID` in `Tattle.toc`. The zip is
+verified to contain the 12.x addon and nothing else: four modules, core, config, screen
+alert, event listener, the TOC, the TGA and nothing from `Tests` or `Tools`
+
+**Still missing**: a CurseForge API token in the repository secrets. Without it the packager
+skips CurseForge and publishes GitHub only, which is what this release did
+
 ### Renamed: Snitch -> Tattle
 **Before**: the addon, its folder, its chat command (`/snitch`), its global and its
 saved variables (`SnitchDB`) were all called Snitch
