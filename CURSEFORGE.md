@@ -11,7 +11,7 @@ Fill before publishing:
   * Summary field -> the one-liner below the H1 (255 characters available)
   * Project icon  -> upload Tools/tattle-turtle-512.png
   * Category      -> Utility, Damage Reduction (minor field)
-  * License field -> pick one in the project settings until a LICENSE file exists
+  * License field -> MIT, matching the LICENSE file in the repository
 
 For the file itself (packager does all of this automatically once CF_API_TOKEN is a
 repository secret, otherwise upload .release/Tattle-<version>.zip by hand):

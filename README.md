@@ -215,3 +215,9 @@ Built following WoW addon best practices:
 ## Version
 
 Current version is defined in `Tattle.toc`
+
+## License
+
+MIT (`LICENSE`), the same terms as tarballs-dadabase. `LICENSE` is not in the
+`.pkgmeta` ignore list, so it ships inside the addon folder: the repository, the
+CurseForge project's license field and the zip somebody installs all agree.

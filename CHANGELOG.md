@@ -5,6 +5,7 @@ All notable changes to Tattle will be documented in this file.
 ## [0.2.0-alpha.1] - 2026-11-03
 
 ### Added
+- **MIT license** (`LICENSE`), the same terms as tarballs-dadabase. `LICENSE` is not in the `.pkgmeta` ignore list, so it ships inside the packaged addon folder too - the repository, the CurseForge project's license field and the zip a user installs all say the same thing
 - **`CURSEFORGE.md`**: the project page copy, kept in the repo so it stays true to the code. Every claim in it was checked against the source - alert strings against the tests, chat channels against `CHAT_TYPE_OPTIONS`, sounds against `SOUND_OPTIONS`, the combat behaviour against each module's own `UnitAffectingCombat` check. Excluded from the packaged addon via `.pkgmeta`
 - **`DESCRIPTION.md`**: the short, image-free summary of what Tattle is for, written for someone deciding whether to install it rather than for someone maintaining the repo
 - **CurseForge publishing is wired up.** `Tattle.toc` now carries `## X-Curse-Project-ID: 1782380`, `release.yml` triggers on an annotated tag push instead of waiting for a hand-made GitHub Release, and one run builds the zip, publishes the GitHub release and uploads to CurseForge. The CurseForge half still needs one thing the repo does not have: a CurseForge API token stored as the `CF_API_TOKEN` repository secret (the packager calls the variable `CF_API_TOKEN`; `CF_API_KEY` is accepted as well). Without it the upload is skipped and the release asset can be dragged onto the CurseForge files page by hand
@@ -54,6 +55,7 @@ The addon has no `OnUpdate` anywhere, so there was and is no per-frame or GPU co
 - Whether your client is told other players' targets at all is a patch and context question. "Targeting you" reports what it can read and `/tattle probe` shows the raw reads, so an empty list is never silently mistaken for "nobody is looking"
 - A Neural Silencer is documented to block Swapblaster and Leap of Faith. The Rescue call-out is inference from a flight that marked nobody, and says "attempted" for that reason
 - **Why `0.2.0-alpha.1`.** The last tag was `v0.1.0-alpha.1`, dated after `0.1.0`, which inverts the series: a pre-release of a version that already shipped. This release reopens it in order - `0.2.0` is the next feature line, and `-alpha.1` says it is still being tested in a raid, which an alpha is supposed to mean. Two things are deliberately *not* in it: naming a Swapblaster's victim (the swap marks nobody, so there is nothing to prove), and a scrollable event history window
+- **The tag was re-cut from `v0.2.0-alpha.1` once.** The first cut had 0 asset downloads and no CurseForge file, and it pointed at a commit whose `release.yml` read the token from a secret named `CF_API_KEY` while the repository secret is `CF_API_TOKEN`, so the packager saw an empty token and skipped CurseForge. The tag now points at a commit whose workflow accepts either name, and the re-cut build also carries `LICENSE`
 
 ## [0.1.0-alpha.1] - 2026-10-31
 

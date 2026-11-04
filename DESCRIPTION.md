@@ -85,4 +85,4 @@ but are not War Within spells, so they cannot cross the boundary either.
 - Saved variables: `TattleDB`
 - Dependencies: none
 - Tests: a stub WoW client harness, `Tests/wow_stub.lua`, 97 checks
-- License: not yet chosen
+- License: MIT (`LICENSE`)
