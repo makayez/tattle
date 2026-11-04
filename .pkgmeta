@@ -1,4 +1,4 @@
-package-as: Snitch
+package-as: Tattle
 
 enable-nolib-creation: no
 
@@ -6,9 +6,14 @@ enable-nolib-creation: no
 # should never ship inside the packaged addon folder.
 ignore:
   - Tests
+  - Tools
+  - CURSEFORGE.md
+  - DESCRIPTION.md
   - FEATURES.md
   - PROJECT_SUMMARY.md
   - TESTING.md
   - UPDATES.md
   - .github
   - .gitignore
+  # Repo-only art; the game loads the .tga, which does ship.
+  - TattleTurtle.png

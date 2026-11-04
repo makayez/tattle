@@ -1,8 +1,15 @@
 name: Release
 
+# Push an annotated tag (v*) and this builds the addon zip with
+# BigWigsMods/packager, creates the GitHub release for the tag, and uploads the
+# zip to CurseForge using the ## X-Curse-Project-ID in Tattle.toc.
+#
+# CurseForge is skipped when the CF_API_KEY secret is missing: the GitHub release
+# still happens, so the tag pipeline works before the CurseForge key is wired up.
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   release:
@@ -23,7 +30,9 @@ jobs:
         env:
           GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}
 
-          # CurseForge publishing is disabled: Snitch has no CurseForge project yet.
-          # Once one exists, add the CF_API_KEY repository secret (a CurseForge
-          # project API key) and uncomment the line below.
-          # CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          # CurseForge project API key, created at authors.curseforge.com under
+          # account settings -> API tokens, stored as a repository secret named
+          # CF_API_KEY. The packager docs name the variable CF_API_TOKEN and the
+          # action also accepts CF_API_KEY, so both are supplied from one secret.
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          CF_API_TOKEN: ${{ secrets.CF_API_KEY }}

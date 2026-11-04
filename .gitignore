@@ -17,6 +17,14 @@ Thumbs.db
 # Packaging
 *.zip
 releases/
+.release/
 
 # Testing
 test-results/
+
+# Scratch and tooling byproducts
+.tmp.*
+*.dump
+.packager_readme.md
+__pycache__/
+*.pyc
