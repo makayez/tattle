@@ -42,6 +42,11 @@ noop = setmetatable({}, {
 })
 
 local frames = {}          -- every frame created, for the proxy audit
+-- Geometry setters that were handed a nil where the client demands a number. Real
+-- WoW raises an error there; a stub that quietly ignores the nil lets a whole class
+-- of "constant I forgot to define" bug walk past green. See the check that reads
+-- this list at the end of the run.
+local nilGeometry = {}
 local eventFrames = {}     -- event name -> { frame, ... }
 local timers = {}
 local tickers = {}         -- { interval = n, fn = f, Cancel = ... }, for manual sweeps
@@ -50,8 +55,27 @@ local printLog = {}
 
 local newFrame
 do
+    -- A frame you did not model answers every unknown key with a no-op, so a
+    -- wrong method name is invisible. Reading one is recorded in _proxied and
+    -- printed at the end of the run: a new entry there is usually a typo, not a
+    -- missing stub. Two kinds of read are not typos and stay out of that audit --
+    -- a field the frame really has (its kind, or a name that is nil for an
+    -- unnamed frame), and a field the addon put on the frame itself (a saved
+    -- position, a colour, the warning banner a tab shows when the addon is off).
+    local OWN_FIELDS = { name = true, kind = true, template = true }
+    -- Which field names the addon uses for its own state, collected as it goes:
+    -- `container.warning = banner` in one place means `if tab.warning then` on a
+    -- tab that has no banner is a nil read, not a misspelled widget method. It is
+    -- the set of names seen anywhere rather than per frame, because the read often
+    -- happens on a different frame than the write -- which is the whole point.
+    local writtenFields = {}
     local frame_mt = {
+        __newindex = function(f, key, value)
+            writtenFields[key] = true
+            rawset(f, key, value)
+        end,
         __index = function(f, key)
+            if OWN_FIELDS[key] or writtenFields[key] then return rawget(f, key) end
             f._proxied[key] = true
             return noop
         end,
@@ -121,11 +145,28 @@ do
         -- Width/position have to be real numbers: CreateTabButton packs tab
         -- buttons with `x + button:GetWidth() + gap`, and ScreenAlert reads
         -- GetPoint when saving a dragged position.
-        f.SetWidth = function(_, w) if type(w) == "number" then f._width = w end end
-        f.SetSize = function(_, w, h)
-            if type(w) == "number" then f._width = w end
-            if type(h) == "number" then f._height = h end
+        -- Every argument the caller actually passed is inspected, including one
+        -- that arrived as nil: select('#', ...) counts it, so f:SetSize(w, nil) is
+        -- caught while f:SetSize(w, h) with a real h is not.
+        local function audit(name, ...)
+            local count = select("#", ...)
+            for i = 1, count do
+                if select(i, ...) == nil then
+                    nilGeometry[#nilGeometry + 1] =
+                        name .. " got nil argument #" .. i
+                end
+            end
         end
+
+        f.SetWidth = function(_, w) audit("SetWidth", w); if type(w) == "number" then f._width = w end end
+        f.SetHeight = function(_, ht) audit("SetHeight", ht); if type(ht) == "number" then f._height = ht end end
+        f.SetSize = function(_, w, ht)
+            audit("SetSize", w, ht)
+            if type(w) == "number" then f._width = w end
+            if type(ht) == "number" then f._height = ht end
+        end
+        f.SetPoint = function(_, ...) audit("SetPoint", ...) end
+        f.SetFont = function(_, path, size) audit("SetFont", path, size) end
         f.GetWidth = function() return f._width or 100 end
         f.GetHeight = function() return f._height or 24 end
         f.GetPoint = function() return "TOP", "UIParent", "TOP", 0, -200 end
@@ -208,22 +249,62 @@ SlashCmdList = {}
 -- Group / unit state
 -- ============================================================================
 
-local unitNames = { raid1 = "Donut", raid2 = "Pancakes", player = "Me" }
+-- Names for the units a check can see. In a raid of three you are raid3, so the
+-- named *other* members are raid1 and raid2 -- the shape every check below
+-- assumes. The party branch never numbers you, so party1..party4 are the others.
+local RAID_NAMES  = { "Donut", "Pancakes", "Waffles", "Syrup", "Maple" }
+local PARTY_NAMES = { "Donut", "Pancakes", "Waffles", "Syrup" }
 
 -- Group shape, driven by setGroup() so a check can be solo, a party, a plain
 -- raid, or an LFR raid. `normalRaid` is what IsInRaid(LE_GROUP_TYPE_RAID) sees:
 -- false in LFR, which is exactly the difference Tattle.ResolveChatChannel needs.
-local group = { inRaid = true, normalRaid = true, count = 2, party = false }
+--
+-- Modelled the way the client numbers a group, because the difference is load
+-- bearing: in a raid you hold one of the raidN indexes and GetNumGroupMembers()
+-- counts you, while a party numbers only the other four and calls you "player".
+-- A stub in which raid1 and raid2 are both *other* players inside a raid of two
+-- is not a shape the game can produce, and it is what let the addon scan itself
+-- twice without a single check noticing.
+local group = { inRaid = true, normalRaid = true, count = 3, party = false, selfIndex = 3 }
 local function setGroup(opts)
     group.inRaid = opts.raid or false
     group.normalRaid = opts.normalRaid == nil and (opts.raid or false) or opts.normalRaid
-    group.count = opts.count or (opts.raid and 2 or 0)
     group.party = opts.party or false
+    group.count = opts.count or (group.inRaid and 3 or (group.party and 3 or 0))
+    -- Which raidN is you. Meaningless in a party, where there is no index for you.
+    group.selfIndex = opts.selfIndex or group.count
     -- A real client fires GROUP_ROSTER_UPDATE after any of this, and the core
     -- drops its cached unit-token lists on that event. Drop them here too, or
     -- every check below would read a stale group.
     if Tattle and Tattle.InvalidateGroupCaches then Tattle.InvalidateGroupCaches() end
 end
+
+-- Two different tokens name the same player when one of them is your raid index.
+local function isMe(token)
+    return token == "player" or (group.inRaid and token == "raid" .. group.selfIndex)
+end
+
+local function nameFor(token)
+    if token == "player" then return "Me" end
+    if group.inRaid then
+        local n = tonumber(string.match(token, "^raid(%d+)$"))
+        if n then
+            if n > group.count then return nil end
+            if n == group.selfIndex then return "Me" end
+            return RAID_NAMES[n]
+        end
+    end
+    if group.party then
+        local n = tonumber(string.match(token, "^party(%d+)$"))
+        -- A party of five has party1..party4 and no party5: you are "player".
+        if n then
+            if n > group.count - 1 then return nil end
+            return PARTY_NAMES[n]
+        end
+    end
+    return nil
+end
+
 IsInRaid = function(groupType)
     if groupType then return group.inRaid and group.normalRaid or false end
     return group.inRaid
@@ -234,36 +315,44 @@ IsInLFGGroup = function() return group.inRaid and not group.normalRaid end
 GetNumGroupMembers = function() return group.count end
 LE_GROUP_TYPE_RAID = "raid"
 
--- "<member>target" tokens: group.targets["raid1"] = "player" means Donut is
--- targeting you. nil means the token resolves to nothing, as it does for a
--- client that is not told other players' targets.
+-- "<member>target" tokens: targets["raid2target"] = "player" means Pancakes has
+-- you targeted. nil means the token resolves to nothing, as it does for a client
+-- that is not told other players' targets.
 local targets = {}
 
 UnitExists = function(unit)
-    if unit:match("target$") then return targets[unit] ~= nil end
-    return unitNames[unit] ~= nil
+    if string.match(unit, "target$") then return targets[unit] ~= nil end
+    return nameFor(unit) ~= nil
 end
 UnitName = function(unit)
-    local owner = unit:match("^(.-)target$")
+    local owner = string.match(unit, "^(.-)target$")
     if owner then
         local who = targets[unit]
-        return who and (unitNames[who] or who)
+        return who and (nameFor(who) or who)
     end
-    return unitNames[unit]
+    return nameFor(unit)
 end
 UnitIsUnit = function(a, b)
-    if a:match("target$") then return targets[a] == b end
+    if string.match(a, "target$") then return targets[a] == b end
+    if isMe(a) then return isMe(b) end
+    if isMe(b) then return isMe(a) end
     return a == b
 end
+-- Both membership queries answer for you as well as for the numbered members, the
+-- way they do on a real client: UnitInRaid("player") is true in a raid, and
+-- UnitInParty("player") is not.
 UnitInRaid = function(unit)
-    if unit == "raid1" then return group.inRaid and 1 or nil end
-    if unit == "raid2" then return group.inRaid and 2 or nil end
+    if not group.inRaid then return nil end
+    if isMe(unit) then return group.selfIndex end
+    local n = tonumber(string.match(unit, "^raid(%d+)$"))
+    if n and n <= group.count then return n end
     return nil
 end
 UnitInParty = function(unit)
     if not group.party then return nil end
-    if unit == "party1" then return 1 end
-    if unit == "party2" then return 2 end
+    if unit == "player" then return nil end
+    local n = tonumber(string.match(unit, "^party(%d+)$"))
+    if n and n <= group.count - 1 then return n end
     return nil
 end
 
@@ -308,9 +397,17 @@ end
 
 -- auras[unit][spellName] = spellID, driven by the checks that need a target.
 local auras = {}
+-- Auras belong to a person, not to a token: setting one on your raid index puts it
+-- on you, and reading it back through "player" finds it. Matches the aliasing in
+-- C_UnitAuras.GetAuraDataBySpellName below, and is what lets a check set an aura
+-- where a raidN-walking sweep would look for it.
+local function auraKey(unit)
+    return isMe(unit) and "player" or unit
+end
 local function setAura(unit, spellName, spellID)
-    auras[unit] = auras[unit] or {}
-    auras[unit][spellName] = spellID
+    local key = auraKey(unit)
+    auras[key] = auras[key] or {}
+    auras[key][spellName] = spellID
 end
 local function clearAuras()
     for unit in pairs(auras) do auras[unit] = nil end
@@ -319,7 +416,11 @@ end
 C_UnitAuras = {}
 do
     local function getAuraData(unit, spellName, filter)
-        local byUnit = auras[unit]
+        -- An aura on you is readable through your raid index as well as through
+        -- "player", so auras are keyed by person, not by token. That is what makes a
+        -- double-counting sweep observable: read you twice and the wearer list gains
+        -- a second copy of you.
+        local byUnit = auras[auraKey(unit)]
         local spellID = byUnit and byUnit[spellName]
         if not spellID then return nil end
         return { spellID = spellID, name = spellName, auraInstanceID = spellID }
@@ -467,13 +568,15 @@ local function muteAllModules()
 end
 
 local function resetWorld()
-    setGroup({ raid = true, count = 2 })
+    setGroup({ raid = true })
     setCombatUnits()
     clearAuras()
     for token in pairs(targets) do targets[token] = nil end
 end
 
--- A group member with a Neural Silencer up, by short name.
+-- A group member with a Neural Silencer up, by short name. "Me" is you, and you
+-- are addressed as "player" here even though you also hold a raidN index -- the
+-- core is what has to reconcile those two, so the helper uses the plain token.
 local function silenceWho(name)
     local token = (name == "Me") and "player" or (name == "Donut") and "raid1" or "raid2"
     setAura(token, "Neural Silencer", 156779)
@@ -505,24 +608,48 @@ if not files then
     os.exit(1)
 end
 
+-- The client hands each file in the TOC the addon name and one shared namespace
+-- table, and every Tattle file takes them as `local _, Tattle = ...`. So the
+-- harness has to pass the same table to every chunk: passing it once per file is
+-- what makes the addon's files see each other's exports, and passing nothing at
+-- all is what makes them fail loudly rather than quietly build a parallel global.
+--
+-- It is then published as the global `Tattle` for the checks below, which are
+-- written against the addon's public surface the way any other addon would be.
+local namespace = {}
+
+-- Every global the addon leaves in the client, captured before its files run. The
+-- namespace arrives as a vararg (`local _, Tattle = ...`), so a file that assigns
+-- a global at load time is doing something it no longer has a reason to do.
+-- `Tattle` is on the allow list because *this* harness publishes the namespace as
+-- a global for its own checks; the addon never does.
+local ALLOWED_GLOBALS = { Tattle = true, TattleDB = true, SLASH_TATTLE1 = true }
+local globalsBeforeLoad = {}
+for key in pairs(_G) do globalsBeforeLoad[key] = true end
+
 local loadErrors = {}
 for _, file in ipairs(files) do
     local chunk, err = loadfile(ADDON_DIR .. "/" .. file)
     if not chunk then
         table.insert(loadErrors, file .. ": " .. tostring(err))
     else
-        local ok, runErr = pcall(chunk, "Tattle")
+        local ok, runErr = pcall(chunk, "Tattle", namespace)
         if not ok then table.insert(loadErrors, file .. ": " .. tostring(runErr)) end
     end
 end
 
+Tattle = namespace
+
 realPrint("== Checks ==")
 
--- CHECKS (each one guards behaviour that must not regress):
---  1. every file loads and ADDON_LOADED completes without a Lua error
+-- CHECKS (each one guards behaviour that broke once, or would break silently):
+--  1. every file loads, ADDON_LOADED completes without a Lua error, and the addon
+--     leaves no globals behind beyond TattleDB and its slash command (the
+--     namespace comes from the TOC vararg, so a global is a file forgetting that)
 --  2. the load banner and the Interface Options entry both happen
 --  3. modules register in TOC order (pairs() over a string-keyed table has no
---     defined order, so tabs and /tattle status would reshuffle run to run)
+--     defined order, so tabs and /tattle status would reshuffle run to run), and a
+--     module that registers after ADDON_LOADED still gets settings and listeners
 --  4. Swapblaster's real cast (spell 161399) is channeled: CHANNEL_START and
 --     CHANNEL_STOP drive it, and the START/SUCCEEDED twins must not announce
 --     the same cast twice
@@ -540,25 +667,44 @@ realPrint("== Checks ==")
 --     real edits, persists on Save, and restores defaults on Reset
 -- 12. /tattle probe toggles the event probe on and off, and prints nothing while
 --     you are solo (nothing it measures can happen without a group)
--- 13. the Swapblaster is never evaluated on a cast start while its caster is
---     fighting, but a swap that started out of combat still announces a landing
---     that happens after combat begins
--- 14. "Raid" chat is delivered on the instance channel in an LFR raid, which is
+-- 13. the combat gate the core applies: a Swapblaster start while its caster is
+--     fighting is dropped, but a swap that started out of combat still announces a
+--     landing that happens after combat began; the grab spells are dropped at any
+--     phase while their caster is fighting
+-- 14. the group's unit tokens name you once, as "player", and never as your own
+--     raid index too -- which is what the watch list, the protected-person
+--     sentences and the Rescue passenger list are all built from
+-- 15. "Raid" chat is delivered on the instance channel in an LFR raid, which is
 --     where a plain RAID send vanishes
--- 15. a grab or swap that a Neural Silencer bounced says so, naming the protected
+-- 16. a grab or swap that a Neural Silencer bounced says so, naming the protected
 --     member when there is only one candidate, and a protected caster firing a
 --     Swapblaster out of combat is called out for it
--- 16. the optional watch list names the protected members and whoever has you
---     targeted, hides itself when you leave the group, announces a fresh
---     Neural Silencer exactly once, and stops its timer when switched off
--- 17. what a cast event costs: one spell-name resolution per event however many
+-- 17. the optional watch list names the protected members and whoever has you
+--     targeted, hides itself when you leave the group, and stops its timer when
+--     switched off -- and a group member who puts one on says nothing at all
+-- 18. what a cast event costs: one spell-name resolution per event however many
 --     modules listen, alerts survive a client without C_Spell.GetSpellName, and
 --     the cached group token lists die with the roster that produced them
--- 18. joining says nothing: wearing a Neural Silencer is never announced, only
+-- 19. joining says nothing: wearing a Neural Silencer is never announced, only
 --     being involved in a cast mentions it; pets, minions and NPCs are rejected
---     before their spell is ever named, and your own casts still alert
+--     before their spell is ever named, unless a module asked for every caster,
+--     and your own casts still alert
+--
+-- Two audits run alongside the checks: widget keys the stub does not model are
+-- printed at the end (a new one is usually a typo), and a widget setter handed
+-- `nil` where the client demands a number is a failure rather than a shrug.
 
 check("all files load", #loadErrors == 0, table.concat(loadErrors, "; "))
+
+local leakedGlobals = {}
+for key in pairs(_G) do
+    if not globalsBeforeLoad[key] and not ALLOWED_GLOBALS[key] then
+        leakedGlobals[#leakedGlobals + 1] = key
+    end
+end
+table.sort(leakedGlobals)
+check("the addon leaves no globals behind beyond its saved variables and its slash command",
+    #leakedGlobals == 0, table.concat(leakedGlobals, ", "))
 
 local eventErrors = dispatch("ADDON_LOADED", "Tattle")
 runTimers()
@@ -719,18 +865,24 @@ check("chatType PRIVATE sends nothing to chat", #sentMessages == 0, "got " .. #s
 check("chatType PRIVATE still prints to the console",
     lastPrintContaining("Donut is casting Swapblaster") ~= nil)
 
--- scope "self" means "it involved me", not "I cast it": someone else's cast
--- aimed at you is the whole point of the addon.
+-- Scope "self" means "it involved me", not "I cast it": someone else's cast
+-- aimed at you is the whole point of the addon. The gate is asked in the
+-- negative -- "may this be dropped?" -- so that "I cannot tell" and "not mine"
+-- are the same answer, and the answer is always a boolean.
 TattleDB.modules.lifegrip.scope = "self"
-check("scope self rejects a resolved target that is not you",
-    Tattle.ShouldReport("lifegrip", "raid2", { "raid1" }) == false)
-check("scope self accepts a resolved target that includes you",
-    Tattle.ShouldReport("lifegrip", "raid2", { "raid1", "player" }) == true)
-check("scope self accepts your own cast",
-    Tattle.ShouldReport("lifegrip", "player") == true)
-check("scope self treats an unresolved target as reportable",
-    Tattle.ShouldReport("lifegrip", "raid2") == nil
-        and Tattle.ShouldReport("lifegrip", "raid2", {}) == nil)
+check("scope self drops a resolved target that is not you",
+    Tattle.ScopeDrops("lifegrip", "raid2", { "raid1" }) == true)
+check("scope self keeps a resolved target that includes you",
+    Tattle.ScopeDrops("lifegrip", "raid2", { "raid1", "player" }) == false)
+check("scope self keeps your own cast",
+    Tattle.ScopeDrops("lifegrip", "player") == false)
+check("an unresolved target is never provably not you",
+    Tattle.ScopeDrops("lifegrip", "raid2") == false
+        and Tattle.ScopeDrops("lifegrip", "raid2", {}) == false)
+check("the scope gate says yes or no, never maybe",
+    type(Tattle.ScopeDrops("lifegrip", "raid2")) == "boolean"
+        and type(Tattle.ScopeDrops("lifegrip", "raid2", {})) == "boolean"
+        and type(Tattle.ScopeDrops("nosuchmodule", "raid2")) == "boolean")
 
 table.wipe(sentMessages)
 clearAuras()
@@ -748,14 +900,14 @@ check("scope self still reports when the target cannot be resolved",
     #sentMessages == 1, "got " .. #sentMessages)
 
 TattleDB.modules.lifegrip.scope = "group"
-check("scope group accepts another member's cast",
-    Tattle.ShouldReport("lifegrip", "raid2", { "raid1" }) == true)
+check("scope group keeps another member's cast",
+    Tattle.ScopeDrops("lifegrip", "raid2", { "raid1" }) == false)
 
 -- Swap applies no aura to either side, so "self" can never rule it out.
 alertMode("swapblaster", "YELL")
 TattleDB.modules.swapblaster.scope = "self"
 check("scope self cannot rule out a Swapblaster",
-    Tattle.ShouldReport("swapblaster", "raid2") == nil)
+    Tattle.ScopeDrops("swapblaster", "raid2") == false)
 table.wipe(sentMessages)
 setClock(4000)
 dispatch("UNIT_SPELLCAST_START", "raid2", "guid-10", 161399)
@@ -765,7 +917,7 @@ check("scope self keeps a Swapblaster warning it cannot place", #sentMessages ==
 TattleDB.modules.swapblaster.scope = "group"
 
 -- ============================================================================
--- Combat: only the Swapblaster is gated out of it
+-- Combat: the Swapblaster is judged at the start, the grab spells everywhere
 -- ============================================================================
 
 -- "Cannot be used in combat" is printed on the toy, so a cast start cannot exist
@@ -796,24 +948,80 @@ check("a swap that started out of combat still announces its completion",
     messageContaining("Donut used Swapblaster") ~= nil,
     sentMessages[1] and sentMessages[1].message)
 
--- Life Grip and Rescue are deliberately not gated: a grip or a rescue is still
--- worth seeing in combat, and each module decides what to say about it. They
--- ignore in-combat casts by their own rules, which the next check pins: gating
--- them in the core would be indistinguishable from a regression here, so what is
--- asserted is that they are still *dispatched* (they alert when out of combat).
+-- Life Grip and Rescue are gated wholesale (outOfCombat = "all"): both are
+-- instant, so a grab that resolves while its caster is fighting is a raid tool
+-- doing its job, not a mugging. The policy lives in the core so the modules do
+-- not each carry a copy -- which means this check is now about the core's gate
+-- rather than a module's own filter. Either way the observable contract is the
+-- same: a caster who is fighting does not get announced, and the same caster a
+-- moment later does.
 alertMode("lifegrip", "PARTY")
 resetWorld()
 table.wipe(sentMessages)
 setCombatUnits("raid2")
 dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-lg-combat", 73325)
 runTimers()
-check("Life Grip is still dispatched in combat (it filters the cast itself, not the core)",
+check("the core's combat gate drops an in-combat Life Grip",
     #sentMessages == 0, "got " .. #sentMessages)
 setCombatUnits()
 table.wipe(sentMessages)
 dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-lg-ooc", 73325)
 runTimers()
 check("and the same caster alerts once out of combat", #sentMessages == 1, "got " .. #sentMessages)
+resetWorld()
+
+-- ============================================================================
+-- The group's unit tokens
+-- ============================================================================
+
+-- In a raid you are one of raid1..raidN and GetNumGroupMembers() counts you; in a
+-- party you are "player" and the numbers are other people. The core has to hand
+-- back a list in which you appear exactly once, as "player", or every group-wide
+-- sweep reads you twice -- cosmetic in the watch list ("you and you"), real in the
+-- Rescue attribution, where an Evoker who rescued Pancakes is reported as having
+-- also been rescued by themselves.
+
+local unitTokens = Tattle.GroupUnitTokens()
+local playerEntries, selfIndexEntries = 0, 0
+for _, token in ipairs(unitTokens) do
+    if token == "player" then playerEntries = playerEntries + 1 end
+    if token == "raid" .. group.selfIndex then selfIndexEntries = selfIndexEntries + 1 end
+end
+check("you are in the group's unit list exactly once",
+    playerEntries == 1, "found 'player' " .. playerEntries .. " time(s)")
+check("your own raid index is not in that list as well",
+    selfIndexEntries == 0, "found raid" .. group.selfIndex .. " " .. selfIndexEntries .. " time(s)")
+
+local ownTargetEntries = 0
+for _, entry in ipairs(Tattle.GroupTargetEntries()) do
+    if entry.owner == "raid" .. group.selfIndex then ownTargetEntries = ownTargetEntries + 1 end
+end
+check("the watcher sweep never reads its own target",
+    ownTargetEntries == 0, "found " .. ownTargetEntries .. " entry(ies) for your own raid index")
+
+-- One protected person, named once. Set on your raid index -- where a sweep that
+-- walks raidN really would find it -- and read out through the core's helper.
+setAura("raid" .. group.selfIndex, "Neural Silencer", 156779)
+local protected = Tattle.SilencerWearerNames({ "you" })
+check("you are named once in a protected list, not once per token",
+    #protected == 1 and protected[1] == "you",
+    table.concat(protected, " / ") or "(nobody)")
+
+-- Rescue marks the Evoker with the same aura as the passenger, so a sweep that
+-- read you twice would report you as your own passenger. Real marks: you cast it,
+-- you and Pancakes both carry it, and only Pancakes was moved.
+setAura("player", "Rescue", 370666)
+setAura("raid2", "Rescue", 370666)
+alertMode("rescue", "PARTY")
+table.wipe(sentMessages)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "player", "guid-self-rescue", 370666)
+runTimers()
+local selfRescue = messageContaining("used Rescue")
+check("your own Rescue mark is not read as a second passenger",
+    selfRescue ~= nil
+    and (selfRescue.message or ""):find("Pancakes", 1, true) ~= nil
+    and (selfRescue.message or ""):find("you", 1, true) == nil,
+    selfRescue and selfRescue.message)
 resetWorld()
 
 -- ============================================================================
@@ -1023,7 +1231,7 @@ setGroup({})
 setClock(7000)
 fireTickers()
 check("the list hides itself when you are not grouped", watch and not watch:IsShown())
-setGroup({ raid = true, count = 2 })
+setGroup({ raid = true })
 setClock(7100)
 fireTickers()
 check("and returns when you group up again", watch and watch:IsShown())
@@ -1227,7 +1435,7 @@ dispatch("UNIT_SPELLCAST_SUCCEEDED", "player", "guid-solo-probe", 161399)
 local probePrintsSolo = #printLog - probeLogBefore
 
 probeLogBefore = #printLog
-setGroup({ raid = true, count = 2 })
+setGroup({ raid = true })
 dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid1", "guid-grouped-probe", 161399)
 local probePrintsGrouped = #printLog - probeLogBefore
 check("/tattle probe prints nothing while solo", probePrintsSolo == 0,
@@ -1244,6 +1452,46 @@ check("/tattle probe disarms the event probe", okProbe2 and Tattle._probeFrame =
 -- Proxy audit: every key that resolved to the no-op proxy. These should all be
 -- real FrameXML methods; anything else is a field the addon never defined.
 -- ============================================================================
+-- Registering a module after ADDON_LOADED
+-- ============================================================================
+
+-- Nothing should register late -- the TOC loads every module before Core's
+-- ADDON_LOADED fires -- but a module that does must not be left half wired: it
+-- needs settings, and it needs its listeners installed, because the core
+-- registered its events at start-up and has no second chance to rebuild them. The
+-- first version of the core skipped both, and skipped them silently.
+
+local lateEvents = 0
+Tattle:RegisterModule("latecomer", {
+    name = "Late joiner",
+    allCasters = true,   -- opts out of the group-member filter outright
+    events = { "UNIT_SPELLCAST_SUCCEEDED" },
+    onEvent = function() lateEvents = lateEvents + 1 end,
+})
+check("a module registered late still gets settings",
+    type(TattleDB.modules.latecomer) == "table"
+    and type(TattleDB.modules.latecomer.alerts) == "table"
+    and TattleDB.modules.latecomer.enabled == true)
+
+-- A cast by a pet is dropped for every module that takes the default group-member
+-- filter and still delivered to the one that asked for every caster. That opt-out
+-- had no test at all.
+setGroup({ party = true, count = 3 })
+resetWorld()
+setClock(12000)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "partypet1", "guid-late-pet", 73325)
+runTimers()
+check("allCasters delivers a pet cast to the module that asked for it",
+    lateEvents == 1, "the late module saw " .. lateEvents .. " event(s)")
+
+-- Unregistered again, so the checks after this one still describe four modules.
+Tattle.modules.latecomer = nil
+for i = #Tattle.moduleOrder, 1, -1 do
+    if Tattle.moduleOrder[i] == "latecomer" then table.remove(Tattle.moduleOrder, i) end
+end
+Tattle.RebuildModuleListeners()
+
+-- ============================================================================
 -- What a cast event costs
 -- ============================================================================
 -- These run last: they lean on module state the checks above have already
@@ -1252,7 +1500,7 @@ check("/tattle probe disarms the event probe", okProbe2 and Tattle._probeFrame =
 alertMode("swapblaster", "RAID")
 alertMode("lifegrip", "RAID")
 alertMode("rescue", "RAID")
-setGroup({ raid = true, count = 2 })
+setGroup({ raid = true })
 
 -- Four modules listen to cast events. Resolving the spell name per module --
 -- what this used to do -- multiplies the count below four times over, on every
@@ -1286,7 +1534,7 @@ check("a pet, minion or NPC cast is dropped before the spell name is resolved",
 -- ever sees them.
 alertMode("swapblaster", "RAID")
 resetWorld()
-setGroup({ raid = true, count = 2 })
+setGroup({ raid = true })
 runTimers()   -- drain, as above
 table.wipe(sentMessages)
 setClock(9000)
@@ -1301,7 +1549,7 @@ check("your own casts alert too - you are not partyN or raidN",
 -- A client without the allocation-free name lookup still gets alerts: the core
 -- falls back to GetSpellInfo rather than dropping every cast.
 resetWorld()
-setGroup({ raid = true, count = 2 })
+setGroup({ raid = true })
 local savedGetSpellName = C_Spell.GetSpellName
 C_Spell.GetSpellName = nil
 table.wipe(sentMessages)
@@ -1319,6 +1567,15 @@ check("the group token list is reused between scans", cachedTokens == Tattle.Gro
 dispatch("GROUP_ROSTER_UPDATE")
 check("GROUP_ROSTER_UPDATE drops the cached group lists",
     Tattle.GroupUnitTokens() ~= cachedTokens)
+
+-- A nil where the client wants a number is an error on a real client, so it is a
+-- failure here too. Without this, the harness treats SetSize(700, nil) as a shrug.
+local geometrySeen = {}
+for _, line in ipairs(nilGeometry) do
+    if not geometrySeen[line] then geometrySeen[#geometrySeen + 1] = line end
+end
+check("no widget geometry call was handed a nil",
+    #nilGeometry == 0, table.concat(geometrySeen, "; "))
 
 local proxied = {}
 for _, f in ipairs(frames) do

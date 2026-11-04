@@ -8,11 +8,12 @@
 
 ## X-Curse-Project-ID: 1782380
 
-EventListener.lua
 Core.lua
+Probe.lua
+Commands.lua
 ScreenAlert.lua
 Config.lua
+ConfigSpellIDs.lua
 Modules\Swapblaster.lua
-Modules\LifeGrip.lua
-Modules\Rescue.lua
+Modules\CastSpells.lua
 Modules\Silencer.lua

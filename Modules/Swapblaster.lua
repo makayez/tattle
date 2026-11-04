@@ -1,11 +1,12 @@
--- Modules/Swapblaster.lua
+-- Modules/Swapblaster.lua - the toy that trades your position with a group
+-- member, fired at someone who was not asking. Out of combat only, which is the
+-- whole point: it cannot be used in a fight, so a swap is a decision.
 
-Tattle = Tattle or {}
+local _, Tattle = ...
 
 local string_format = string.format
 local ipairs = ipairs
 local type = type
-local C_Spell = C_Spell
 local GetTime = GetTime
 local UnitCastingInfo = UnitCastingInfo
 local UnitChannelInfo = UnitChannelInfo
@@ -21,6 +22,10 @@ local MODULE_DESCRIPTION = "Alerts when a group member fires the Swapblaster toy
 -- Do not confuse it with 162217 (the 2 sec *crafting* spell) or 182081
 -- ("Swapblaster Explosion", the backfire you eat if the target was wearing a
 -- Neural Silencer).
+-- Midnight 12.0+ makes the spellID argument of UNIT_SPELLCAST_* a "secret value"
+-- in restricted contexts: it cannot index a table or be compared with ==. So the
+-- IDs below are resolved to spell names once, at initialize, and every comparison
+-- this module makes is against a name the core handed it.
 local SWAPBLASTER_SPELL_IDS = {
     161399,
 }
@@ -34,58 +39,25 @@ local BACKFIRE_SPELL_IDS = {
     182081,
 }
 
--- Midnight 12.0+ makes the spellID argument from UNIT_SPELLCAST_* a "secret
--- value" in restricted contexts: you cannot index a table with it or compare it
--- with ==. The safe route is to hand it to a Blizzard API (those accept secret
--- values) and compare the plain string that comes back.
---
--- So: at Initialize() resolve our own plain IDs into spell names and cache
--- them; in OnEvent turn the incoming secret into a name with
--- C_Spell.GetSpellInfo and compare names.
-local swapblasterNames = {}  -- populated in Initialize()
-local backfireNames    = {}  -- populated in Initialize()
+-- Both name sets are filled at initialize (see Initialize below). The Neural
+-- Silencer half of the wording is shared: Modules/Silencer.lua owns those spell
+-- IDs and fills Tattle.silencerNames, and every module reads the result.
+local swapNames = {}    -- populated in Initialize
+local backfireNames = {}  -- populated in Initialize
 
--- The Neural Silencer side of things is shared: Modules/Silencer.lua owns the
--- spell IDs and fills Tattle.silencerNames, every module reads the result.
+-- Built in Initialize from the name sets above.
+local isSwap, isBackfire
 
 -- Cast state keyed on unitToken (a plain string, always safe).
 local activeCasts = {}
-
--- The IDs the user entered in-game win; otherwise the shipped ones apply.
--- An empty or missing TattleDB list falls back to the built-in default.
-local function GetWatchedSpellIDs()
-    local settings = Tattle.GetModuleSettings(MODULE_ID)
-    local stored = settings and settings.spellIDs
-    if type(stored) == "table" and #stored > 0 then return stored end
-    return SWAPBLASTER_SPELL_IDS
-end
 
 -- ============================================================================
 -- Helpers
 -- ============================================================================
 
-local function IsNamedSpell(spellID, nameSet)
-    -- spellID may be a secret value -- the resolver accepts it and hands back a
-    -- safe plain string name. Never compare or index with spellID directly.
-    local name = Tattle.ResolveSpellName(spellID)
-    if not name then return false end
-    return nameSet[name] == true
-end
-
--- The dispatcher resolves the name once per event and hands it over; startup and
--- any caller without a resolved name still get the lookup.
-local function MatchesSpell(spellName, spellID, nameSet)
-    if spellName then return nameSet[spellName] == true end
-    return IsNamedSpell(spellID, nameSet)
-end
-
-local function NeuralSilencerNote(wearers)
+local function SilencerNote(wearers)
     if #wearers == 0 then return "" end
     return string_format(" (Neural Silencer worn by %s)", Tattle.FormatList(wearers))
-end
-
-local function WearersNow()
-    return Tattle.SilencerWearerNames()
 end
 
 -- Swap is channeled, so its cast window comes from UnitChannelInfo; a plain cast
@@ -123,7 +95,7 @@ local function ArmCast(unitToken, channelled)
     if existing and not existing.resolved then return nil end
 
     activeCasts[unitToken] = {
-        wearers   = WearersNow(),
+        wearers   = Tattle.SilencerWearerNames(),
         startedAt = GetTime(),
         duration  = CastWindowSeconds(unitToken, channelled),
         resolved  = false,
@@ -150,19 +122,26 @@ end
 -- Event Handler
 -- ============================================================================
 
--- A completed swap. When the caster is the protected one, that is the story
--- worth telling: they fired a movement toy at someone who cannot answer in kind.
--- The generic "worn by" note is dropped in that case, since the clause already
--- names the wearer. Only ever for an out of combat cast -- the core only lets an
--- outOfCombatOnly module see a cast start while the caster is fighting.
-local function CompletionMessage(sourceName, unitToken, wearers)
+-- A completed swap. When the caster is the protected one, that is the story worth
+-- telling: they fired a movement toy at someone who cannot answer in kind, and the
+-- generic "worn by" note is dropped because the clause already names the wearer.
+--
+-- The cheat check is asked first because it is one aura lookup on one unit, where
+-- the fallback is a sweep of every member. Computing the wearer list up front and
+-- passing it in would pay for the sweep on the branch that throws it away.
+--
+-- Never reached for a cast that *began* in combat: the core's "start" policy
+-- dropped that start, so the only completion that gets here belongs to a swap
+-- that started out of combat.
+local function CompletionMessage(sourceName, unitToken)
     if not Tattle.UnitInCombat(unitToken) then
         local clause = Tattle.SilencerCheatClause(unitToken, sourceName)
         if clause then
             return string_format("%s used Swapblaster%s", sourceName, clause)
         end
     end
-    return string_format("%s used Swapblaster%s", sourceName, NeuralSilencerNote(wearers))
+    return string_format("%s used Swapblaster%s",
+        sourceName, SilencerNote(Tattle.SilencerWearerNames()))
 end
 
 -- "Swapblaster Explosion" is what the caster eats when the player they tried to
@@ -198,34 +177,36 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
     -- same event for everybody.
     if not Tattle.IsGroupMemberToken(unitToken) then return end
 
-    local isBackfire = MatchesSpell(spellName, spellID, backfireNames)
-    if not isBackfire and not MatchesSpell(spellName, spellID, swapblasterNames) then return end
+    local backfire = isBackfire(spellName, spellID)
+    if not backfire and not isSwap(spellName, spellID) then return end
 
     local sourceName = Tattle.GetUnitShortName(unitToken)
 
-    -- The backfire is a different spell from the cast, so it resolves here,
-    -- before the watched-spell and scope filters that govern the cast itself.
-    if isBackfire then
+    -- The backfire is a different spell from the cast, so it is settled here,
+    -- before the scope filter that governs the cast itself: it is worth reporting
+    -- whoever fired it, and it has no visible victim to filter on.
+    if backfire then
         HandleBackfire(unitToken, sourceName)
         return
     end
 
-    -- scope == "self" only drops casts we can prove missed you, which for this
-    -- spell is never, so a Swapblaster aimed at a friend is still reported.
-    if Tattle.ShouldReport(MODULE_ID, unitToken) == false then return end
+    -- Scope "self" only drops casts we can prove missed you, which for this spell
+    -- is never -- the swap marks nobody -- so a Swapblaster aimed at a friend is
+    -- still reported.
+    if Tattle.ScopeDrops(MODULE_ID, unitToken) then return end
 
     if event == "UNIT_SPELLCAST_START" or event == "UNIT_SPELLCAST_CHANNEL_START" then
         local cast = ArmCast(unitToken, event == "UNIT_SPELLCAST_CHANNEL_START")
         if not cast then return end
 
-        local note = NeuralSilencerNote(cast.wearers)
+        local note = SilencerNote(cast.wearers)
         Tattle.SendAlert(string_format("%s is casting Swapblaster%s", sourceName, note), MODULE_ID)
         Tattle.DebugPrint("Swapblaster START:", sourceName, note)
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         if not ClaimCast(unitToken) then return end
 
-        Tattle.SendAlert(CompletionMessage(sourceName, unitToken, WearersNow()), MODULE_ID)
+        Tattle.SendAlert(CompletionMessage(sourceName, unitToken), MODULE_ID)
         Tattle.DebugPrint("Swapblaster SUCCESS:", sourceName)
 
     elseif event == "UNIT_SPELLCAST_CHANNEL_STOP" then
@@ -236,11 +217,11 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         local finished = FinishedAsExpected(cast)
 
         if finished == true then
-            Tattle.SendAlert(CompletionMessage(sourceName, unitToken, WearersNow()), MODULE_ID)
+            Tattle.SendAlert(CompletionMessage(sourceName, unitToken), MODULE_ID)
         else
             -- "cut short" when the channel clearly stopped early, and a plainer
             -- "cast ended" when there was no window to measure against.
-            local note = NeuralSilencerNote(WearersNow())
+            local note = SilencerNote(Tattle.SilencerWearerNames())
             Tattle.SendAlert(string_format("%s's Swapblaster %s%s",
                 sourceName, finished == false and "was cut short" or "cast ended", note), MODULE_ID)
         end
@@ -251,7 +232,7 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         if not cast or cast.resolved then return end
         cast.resolved = true
 
-        local note = NeuralSilencerNote(cast.wearers)
+        local note = SilencerNote(cast.wearers)
         Tattle.SendAlert(string_format("%s's Swapblaster failed%s", sourceName, note), MODULE_ID)
         Tattle.DebugPrint("Swapblaster FAILED:", sourceName, note)
 
@@ -272,34 +253,16 @@ end
 local function Initialize()
     Tattle.DebugPrint("Swapblaster module initialized")
 
-    -- Resolve spell IDs to names while they are still safe plain numbers.
-    -- OnEvent uses these name sets to identify secret-value spellIDs.
-    for _, id in ipairs(GetWatchedSpellIDs()) do
-        local info = C_Spell.GetSpellInfo(id)
-        if info and info.name then
-            swapblasterNames[info.name] = true
-            Tattle.DebugPrint("  Watching:", info.name, "(" .. id .. ")")
-        else
-            Tattle.DebugPrint("  WARNING: spell ID", id, "not found — may need updating")
-        end
-    end
+    -- Resolve IDs to names while they are still safe plain numbers, and hand the
+    -- names to the core: an event for a spell nobody registered is dropped before
+    -- any module is woken. The backfire is registered too, even though it is not
+    -- part of the user-editable list -- it is a signal this module reads, not a
+    -- cast the user chose to follow, and the core would otherwise filter it out.
+    Tattle.ResolveSpellNames(swapNames, Tattle.MakeSpellIDs(MODULE_ID, SWAPBLASTER_SPELL_IDS))
+    Tattle.ResolveSpellNames(backfireNames, BACKFIRE_SPELL_IDS)
 
-    -- The backfire is not part of the editable watched-spell list: it is a
-    -- signal this module reads, not a cast the user is choosing to follow.
-    for _, id in ipairs(BACKFIRE_SPELL_IDS) do
-        local info = C_Spell.GetSpellInfo(id)
-        if info and info.name then
-            backfireNames[info.name] = true
-            Tattle.DebugPrint("  Backfire signal:", info.name, "(" .. id .. ")")
-        else
-            Tattle.DebugPrint("  WARNING: Swapblaster backfire spell ID", id, "not found")
-        end
-    end
-
-    -- Hand the names to the core, so it can drop every cast event that is not
-    -- one of ours before it reaches us.
-    Tattle.WatchSpellNames(swapblasterNames)
-    Tattle.WatchSpellNames(backfireNames)
+    isSwap     = Tattle.MakeSpellMatcher(swapNames)
+    isBackfire = Tattle.MakeSpellMatcher(backfireNames)
 end
 
 Tattle:RegisterModule(MODULE_ID, {
@@ -309,9 +272,10 @@ Tattle:RegisterModule(MODULE_ID, {
     initialize  = Initialize,
     onEvent     = OnEvent,
     spellIDs    = SWAPBLASTER_SPELL_IDS,
-    -- "Cannot be used in combat" is on the item: while the caster is fighting,
-    -- a cast start cannot exist, so the core skips the evaluation.
-    outOfCombatOnly = true,
+    -- "Cannot be used in combat" is on the item: while the caster is fighting a
+    -- cast start cannot exist, so the core drops those. The landing still gets
+    -- through, because a swap begun out of combat can be what started the fight.
+    outOfCombat = "start",
     events      = {
         "UNIT_SPELLCAST_START",
         "UNIT_SPELLCAST_SUCCEEDED",

@@ -1,6 +1,6 @@
 -- Config.lua - Configuration panel (one tabbed window)
+local _, Tattle = ...
 
-Tattle = Tattle or {}
 Tattle.Config = {}
 
 local Config = Tattle.Config
@@ -34,12 +34,14 @@ local UIDropDownMenu_SetText = UIDropDownMenu_SetText
 -- Constants
 -- ============================================================================
 
-local CONFIG_PANEL_WIDTH  = 700
--- 700 rather than 650 because the tallest tab is now the Silencers one, which
--- shares the standard alert controls *and* adds a watch list section above its
--- spell ID editor. Tabs are not clipped, so a too-short panel would spill the
--- editor over the window's bottom edge.
-local CONFIG_PANEL_HEIGHT = 700
+local CONFIG_PANEL_WIDTH = 700
+-- The panel is sized to whatever its tallest tab actually occupies -- see
+-- CreateConfigPanel, where every tab builder hands back the depth it used. These
+-- two are the floor and the padding, not the height: a hardcoded 700 was a
+-- standing invitation for the next option added to any tab to spill over the
+-- bottom edge, and a panel is not a scroll frame.
+local PANEL_MIN_HEIGHT = 480
+local PANEL_BOTTOM_PAD = 16
 
 local TAB_BUTTON_LEFT = 20
 local TAB_BUTTON_Y    = -35
@@ -51,7 +53,9 @@ local TAB_RIGHT  = -20
 local TAB_BOTTOM = 20
 
 local CONTENT_WIDTH  = CONFIG_PANEL_WIDTH - TAB_LEFT + TAB_RIGHT            -- 660
-local CONTENT_HEIGHT = CONFIG_PANEL_HEIGHT + TAB_TOP - TAB_BOTTOM           -- 610
+-- The content area's height is whatever the panel ends up being: containers are
+-- anchored to the panel on all four sides (see CreateTabContainer), so sizing the
+-- panel sizes every tab with it.
 
 local LABEL_X       = 20
 local DROPDOWN_X    = 90
@@ -105,29 +109,6 @@ local ALERT_COLORS = {
 -- Spell ID Helpers
 -- ============================================================================
 
-local function ParseSpellIDList(text)
-    local ids = {}
-    if not text then return ids end
-
-    local seen = {}
-    for token in text:gmatch("[^,%s]+") do
-        local id = tonumber(token)
-        if id and id > 0 and not seen[id] then
-            seen[id] = true
-            ids[#ids + 1] = id
-        end
-    end
-    return ids
-end
-
-local function SerializeSpellIDList(ids)
-    if not ids then return "" end
-    local lines = {}
-    for i, id in ipairs(ids) do
-        lines[i] = tostring(id)
-    end
-    return table_concat(lines, "\n")
-end
 
 -- ============================================================================
 -- Control Helpers
@@ -191,9 +172,19 @@ end
 -- Modules/Silencer.lua's extraContent) without reinventing the widgets.
 Config.AddCheckbox = AddCheckbox
 Config.AddDropdown = AddDropdown
+-- The row pitch the controls above assume. A module that lays out its own tab
+-- extras (Modules/Silencer.lua) has to step by the same amount or its rows land
+-- half on top of the next one, and a duplicate constant in a second file is how
+-- those two drift apart.
+Config.CHECKBOX_ROW = CHECKBOX_ROW
+Config.DROPDOWN_ROW = DROPDOWN_ROW
 
 -- Labelled OptionsSliderTemplate with a value readout under the handle.
-function Config:GetSlider(container, y, labelText, width, minValue, maxValue, stepValue, initialValue, lowText, highText, formatFunc, onValueChanged)
+-- A plain function like the other control helpers. It used to be declared
+-- `Config:GetSlider(...)`, which quietly makes `self` the Config table and buys
+-- nothing: nothing in the body uses it, and the colon at the call site was the only
+-- thing suggesting this widget had state of its own.
+local function AddSlider(container, y, labelText, width, minValue, maxValue, stepValue, initialValue, lowText, highText, formatFunc, onValueChanged)
     local label = container:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     label:SetPoint("TOPLEFT", 0, y)
     label:SetText(labelText)
@@ -204,11 +195,24 @@ function Config:GetSlider(container, y, labelText, width, minValue, maxValue, st
     slider:SetMinMaxValues(minValue, maxValue)
     slider:SetValueStep(stepValue)
     slider:SetObeyStepOnDrag(true)
-    slider.Low:SetText(lowText)
-    slider.High:SetText(highText)
 
+    -- The end labels are ours rather than the template's. `OptionsSliderTemplate`
+    -- adds its own as `$parentLow` / `$parentHigh`, which only become reachable
+    -- once the slider is created *named* - this one is anonymous, so there is no
+    -- $parent to prefix and `slider.Low` is nil. Asking the template for a widget
+    -- it has no way to hand over is exactly the kind of bug a stub that answers
+    -- every unknown key with a no-op will hide, so the two strings are made here.
+    local lowLabel = slider:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    lowLabel:SetPoint("TOPLEFT", slider, "BOTTOMLEFT", 0, -2)
+    lowLabel:SetText(lowText)
+
+    local highLabel = slider:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    highLabel:SetPoint("TOPRIGHT", slider, "BOTTOMRIGHT", 0, -2)
+    highLabel:SetText(highText)
+
+    -- centred under the handle, between the two end labels
     slider.valueText = slider:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    slider.valueText:SetPoint("TOP", slider, "BOTTOM", 0, 0)
+    slider.valueText:SetPoint("TOP", slider, "BOTTOM", 0, -2)
     slider.valueText:SetText(formatFunc(initialValue))
 
     slider:SetScript("OnValueChanged", function(self, value)
@@ -334,7 +338,7 @@ local function BuildAboutTab(container)
     notes:SetJustifyH("LEFT")
     notes:SetSpacing(3)
     notes:SetText(
-        "Alerts only fire while you are in a party or a raid. Out of a group, Tattle stays silent: nobody can swap, grip or rescue you without one, so there is nothing to look at. A Swapblaster cast start is not even evaluated while its caster is fighting, because the toy cannot be used in combat - Life Grip and Rescue still are.\n\n" ..
+        "Alerts only fire while you are in a party or a raid. Out of a group, Tattle stays silent: nobody can swap, grip or rescue you without one, so there is nothing to look at. Nothing is announced while the caster is fighting either: Life Grip and Rescue are instant, so one that lands mid-fight is a raid tool doing a job, and the Swapblaster cannot be fired in combat at all - for that one only the decision to fire is judged, so a swap you started while walking still tells you where it ended up.\n\n" ..
         "A chat alert set to Raid is resolved against the group you are actually in, so it also lands in a Looking for Raid raid.\n\n" ..
         "Blizzard's 12.x rules shape what can be detected. COMBAT_LOG_EVENT_UNFILTERED was removed in 12.0.0, " ..
         "so no cast event says who another player's spell was aimed at, and inside instances the spell ID is a " ..
@@ -342,6 +346,10 @@ local function BuildAboutTab(container)
         "those can be attributed by name. Swapblaster marks nobody, so it is reported without a victim. Run " ..
         "/tattle probe to confirm what your client actually exposes before you trust a spell ID or an \"Only me\" filter."
     )
+    -- Measured rather than guessed: a paragraph's height depends on the client's
+    -- font and the player's window width, which is exactly what a hardcoded row
+    -- count gets wrong.
+    return y - notes:GetStringHeight() - 4
 end
 
 -- ============================================================================
@@ -394,6 +402,7 @@ local function BuildGeneralTab(container)
     footer:SetPoint("TOPRIGHT", 0, y)
     footer:SetJustifyH("LEFT")
     footer:SetText("Settings save automatically. Use /reload to apply changes that affect spell IDs.")
+    return y - footer:GetStringHeight() - 4
 end
 
 -- ============================================================================
@@ -434,7 +443,7 @@ local function BuildScreenAlertTab(container)
     end
     y = y - DROPDOWN_ROW
 
-    Config:GetSlider(container, y, "Font Size:", 420, 16, 72, 2, settings.fontSize or 32,
+    AddSlider(container, y, "Font Size:", 420, 16, 72, 2, settings.fontSize or 32,
         "16", "72",
         function(value) return tostring(value) end,
         function(value)
@@ -443,7 +452,7 @@ local function BuildScreenAlertTab(container)
         end)
     y = y - SLIDER_ROW
 
-    Config:GetSlider(container, y, "Display Duration:", 420, 1, 10, 0.5, settings.duration or 3,
+    AddSlider(container, y, "Display Duration:", 420, 1, 10, 0.5, settings.duration or 3,
         "1s", "10s",
         function(value) return string_format("%.1fs", value) end,
         function(value) settings.duration = value end)
@@ -541,119 +550,13 @@ local function BuildScreenAlertTab(container)
         "preview your changes. Font, size, duration, colour and background apply immediately. " ..
         "Whether a module shows a screen warning is set on that module's tab."
     )
+    return y - helpText:GetStringHeight() - 4
 end
 
 -- ============================================================================
 -- Module Tab Content
 -- ============================================================================
 
-local function BuildSpellIDEditor(container, moduleSettings, defaults, labelY)
-    local boxTop = labelY - 30
-    -- Shrink to whatever the tab has left, but never below a usable scribble of
-    -- a box: a tall tab (the Silencer one adds a watch list section) would
-    -- otherwise end up with a zero or negative height editor.
-    local boxHeight = math_max(64, math_min(EDITOR_HEIGHT, CONTENT_HEIGHT + boxTop - 24))
-
-    local box = CreateFrame("Frame", nil, container, "BackdropTemplate")
-    box:SetSize(EDITOR_WIDTH, boxHeight)
-    box:SetPoint("TOPLEFT", container, "TOPLEFT", 0, boxTop)
-    box:SetBackdrop({
-        bgFile = "Interface/Tooltips/UI-Tooltip-Background",
-        edgeFile = "Interface/Tooltips/UI-Tooltip-Border",
-        tile = true, tileSize = 16, edgeSize = 16,
-        insets = { left = 4, right = 4, top = 4, bottom = 4 },
-    })
-    box:SetBackdropColor(0, 0, 0, 0.8)
-
-    local scrollFrame = CreateFrame("ScrollFrame", nil, box, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", 8, -8)
-    scrollFrame:SetPoint("BOTTOMRIGHT", -28, 8)
-
-    local editBox = CreateFrame("EditBox", nil, scrollFrame)
-    editBox:SetMultiLine(true)
-    editBox:SetAutoFocus(false)
-    editBox:SetFontObject(_G.GameFontHighlightSmall)
-    editBox:SetMaxLetters(0)
-    editBox:EnableMouse(true)
-    editBox:EnableKeyboard(true)
-    editBox:SetJustifyH("LEFT")
-    editBox:SetJustifyV("TOP")
-    editBox:SetWidth(EDITOR_WIDTH - 44)
-    editBox:SetHeight(boxHeight - 16)
-    editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-    scrollFrame:SetScrollChild(editBox)
-
-    local function RefreshEditorHeight()
-        local text = editBox:GetText() or ""
-        local lines = 1
-        for _ in text:gmatch("\n") do lines = lines + 1 end
-        editBox:SetHeight(math_max(lines * 14 + 8, boxHeight - 16))
-    end
-
-    -- Clicking the frame or the scroll frame has to land the focus in the EditBox,
-    -- otherwise a click on an unfocused editor looks like it did nothing.
-    box:SetScript("OnMouseDown", function() editBox:SetFocus() end)
-    scrollFrame:SetScript("OnMouseDown", function() editBox:SetFocus() end)
-
-    local status = container:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    status:SetPoint("TOPLEFT", box, "BOTTOMLEFT", 0, -4)
-    status:SetPoint("TOPRIGHT", box, "BOTTOMRIGHT", 0, -4)
-    status:SetJustifyH("LEFT")
-
-    local function storedText()
-        local stored = moduleSettings.spellIDs
-        if type(stored) == "table" and #stored > 0 then
-            return SerializeSpellIDList(stored)
-        end
-        return SerializeSpellIDList(defaults.spellIDs)
-    end
-
-    local saveBtn = CreateFrame("Button", nil, container, "UIPanelButtonTemplate")
-    saveBtn:SetSize(60, 22)
-    saveBtn:SetPoint("TOPLEFT", container, "TOPLEFT", 330, labelY + 4)
-    saveBtn:SetText("Save")
-    saveBtn:Disable()
-
-    local resetBtn = CreateFrame("Button", nil, container, "UIPanelButtonTemplate")
-    resetBtn:SetSize(130, 22)
-    resetBtn:SetPoint("LEFT", saveBtn, "RIGHT", 8, 0)
-    resetBtn:SetText("Reset to Defaults")
-
-    local function UpdateSaveState()
-        if SerializeSpellIDList(ParseSpellIDList(editBox:GetText())) ~= storedText() then
-            saveBtn:Enable()
-        else
-            saveBtn:Disable()
-        end
-    end
-
-    local function Persist(text)
-        local ids = ParseSpellIDList(text)
-        moduleSettings.spellIDs = ids
-        status:SetText(string_format("Saved %d spell ID(s). Type /reload to apply them.", #ids))
-        C_Timer.After(3, function() status:SetText("") end)
-        UpdateSaveState()
-    end
-
-    saveBtn:SetScript("OnClick", function() Persist(editBox:GetText()) end)
-    resetBtn:SetScript("OnClick", function()
-        editBox:SetText(SerializeSpellIDList(defaults.spellIDs))
-        RefreshEditorHeight()
-        Persist(editBox:GetText())
-    end)
-
-    editBox:SetScript("OnTextChanged", function()
-        RefreshEditorHeight()
-        UpdateSaveState()
-    end)
-
-    editBox:SetText(storedText())
-    RefreshEditorHeight()
-    saveBtn:Disable()
-    status:SetText("Type spell IDs here to override the built-in ones. An empty list uses the module's defaults.")
-
-    return box, status
-end
 
 -- A module tab is assembled from sections so a module that needs extra options
 -- (the Silencer watch list) reuses the same controls instead of forking the
@@ -736,7 +639,13 @@ local function AddAlertControls(container, alerts, y)
     testSoundBtn:SetPoint("LEFT", audioDropdown, "RIGHT", -15, -2)
     testSoundBtn:SetText("Test Sound")
     testSoundBtn:SetScript("OnClick", function()
-        PlaySound(alerts.audioFile)
+        -- Guarded for the same reason the real alert plays it guarded: the value
+        -- comes from a dropdown of SOUNDKIT constants, and a patch that renames or
+        -- retires one turns "Test Sound" into a Lua error dialog.
+        local ok, err = pcall(PlaySound, alerts.audioFile)
+        if not ok then
+            print("Tattle: that sound is not available in this client -- " .. tostring(err))
+        end
     end)
     y = y - DROPDOWN_ROW
 
@@ -746,6 +655,8 @@ local function AddAlertControls(container, alerts, y)
     return y - CHECKBOX_ROW
 end
 
+-- The section wrapper is one label and a divider; everything interesting about the
+-- editor itself lives in ConfigSpellIDs.lua.
 local function AddSpellIDSection(container, moduleSettings, moduleId, y)
     local spellLabel = container:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     spellLabel:SetPoint("TOPLEFT", 0, y)
@@ -757,7 +668,7 @@ local function AddSpellIDSection(container, moduleSettings, moduleId, y)
     divider:SetPoint("TOPLEFT", 0, y - 26)
 
     local defaults = (Tattle.GetModuleDefaults and Tattle.GetModuleDefaults(moduleId)) or {spellIDs = {}}
-    BuildSpellIDEditor(container, moduleSettings, defaults, y)
+    return Config.BuildSpellIDEditor(container, moduleSettings, defaults, y)
 end
 
 local function BuildModuleTabContent(container, moduleId)
@@ -778,36 +689,27 @@ local function BuildModuleTabContent(container, moduleId)
         y = module.extraContent(container, moduleId, moduleSettings, y) or y
     end
 
-    AddSpellIDSection(container, moduleSettings, moduleId, y)
+    return AddSpellIDSection(container, moduleSettings, moduleId, y)
 end
 
 -- ============================================================================
 -- Module Tab Registration
 -- ============================================================================
 
-Config.moduleTabs = {}
-
-function Config:RegisterModuleTab(moduleId, options)
-    options = options or {}
-    self.moduleTabs[#self.moduleTabs + 1] = {
-        moduleId     = moduleId,
-        name         = options.name or moduleId,
-        buildContent = options.buildContent or BuildModuleTabContent,
-    }
-end
-
+-- One tab per registered module, in registration order, all of them built by the
+-- same BuildModuleTabContent: a module contributes options (extraContent) rather
+-- than its own tab layout, which is why there is no per-module builder hook here
+-- and no `buildContent` field on the module record.
 function Config:BuildModuleTabs()
-    self.moduleTabs = {}
+    local tabs = {}
     for _, moduleId in ipairs(Tattle.moduleOrder or {}) do
         local module = Tattle.modules[moduleId]
         if module then
-            self:RegisterModuleTab(moduleId, {
-                name         = module.tabName or module.name,
-                buildContent = module.buildContent,
-            })
-            -- (extraContent is read from the module record by the tab builder)
+            tabs[#tabs + 1] = { moduleId = moduleId, name = module.tabName or module.name }
         end
     end
+    self.moduleTabs = tabs
+    return tabs
 end
 
 -- ============================================================================
@@ -816,7 +718,7 @@ end
 
 local function CreateConfigPanel()
     local panel = CreateFrame("Frame", "TattleConfigPanel", UIParent, "BasicFrameTemplateWithInset")
-    panel:SetSize(CONFIG_PANEL_WIDTH, CONFIG_PANEL_HEIGHT)
+    -- Set after the tabs are built, from what they actually occupied (below).
     panel:SetPoint("CENTER")
     panel:SetMovable(true)
     panel:EnableMouse(true)
@@ -837,20 +739,33 @@ local function CreateConfigPanel()
     -- lets tab buttons be packed left to right without hardcoding widths.
     panel.tabMeasure = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 
-    BuildAboutTab(CreateTabContainer(panel))
-    CreateTabButton(panel, "About", panel.tabButtons, false)
-
-    BuildGeneralTab(CreateTabContainer(panel))
-    CreateTabButton(panel, "General", panel.tabButtons, false)
-
-    BuildScreenAlertTab(CreateTabContainer(panel))
-    CreateTabButton(panel, "Screen Alerts", panel.tabButtons, false)
-
-    for _, moduleTab in ipairs(Config.moduleTabs) do
+    -- Every builder returns the y it finished at -- a negative offset below the
+    -- top of its tab -- so the window is built around the tallest tab instead of
+    -- around a number picked when the addon had fewer options in it. Tabs are not
+    -- clipped, so the failure mode of the old fixed 700 was an editor spilling off
+    -- the bottom of the window whenever anyone added a row.
+    local deepest = 0
+    local function addTab(name, isSmall, builder, arg)
         local container = CreateTabContainer(panel)
-        moduleTab.buildContent(container, moduleTab.moduleId)
-        CreateTabButton(panel, moduleTab.name, panel.tabButtons, true)
+        local bottom = builder(container, arg)
+        if type(bottom) == "number" and bottom < deepest then
+            deepest = bottom
+        end
+        CreateTabButton(panel, name, panel.tabButtons, isSmall)
     end
+
+    addTab("About", false, BuildAboutTab)
+    addTab("General", false, BuildGeneralTab)
+    addTab("Screen Alerts", false, BuildScreenAlertTab)
+    for _, moduleTab in ipairs(Config:BuildModuleTabs()) do
+        addTab(moduleTab.name, true, BuildModuleTabContent, moduleTab.moduleId)
+    end
+
+    -- -deepest is how far the tallest tab reached below the top of the content
+    -- area; the area itself starts -TAB_TOP below the top of the window and ends
+    -- TAB_BOTTOM above its bottom.
+    local needed = -deepest + PANEL_BOTTOM_PAD - TAB_TOP + TAB_BOTTOM
+    panel:SetSize(CONFIG_PANEL_WIDTH, math_max(PANEL_MIN_HEIGHT, needed))
 
     panel.currentTab = 1
     panel.tabMeasure:SetText("")

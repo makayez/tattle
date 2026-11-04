@@ -1,6 +1,6 @@
 -- Modules/Silencer.lua
+local _, Tattle = ...
 
-Tattle = Tattle or {}
 Tattle.Silencer = {}
 
 local Silencer = Tattle.Silencer
@@ -67,15 +67,6 @@ local DEFAULT_DISPLAY = {
 -- ============================================================================
 -- Settings
 -- ============================================================================
-
--- The IDs the user entered in-game win; otherwise the shipped ones apply.
-local function GetWatchedSpellIDs(settings)
-    local stored = settings and settings.spellIDs
-    if type(stored) == "table" and #stored > 0 then return stored end
-    return SILENCER_SPELL_IDS
-end
-
-Silencer.GetWatchedSpellIDs = GetWatchedSpellIDs
 
 local function copyPosition(position)
     return {
@@ -144,7 +135,7 @@ local lastRefresh = 0
 local dragMode = false
 
 local function DisplayNameFor(token)
-    if token == "player" then return "you" end
+    if Tattle.IsYou(token) then return "you" end
     return Tattle.GetUnitShortName(token) or "someone"
 end
 
@@ -435,13 +426,15 @@ function Silencer.BuildOptions(container, moduleId, moduleSettings, y)
     header:SetText("On-screen watch list")
     y = y - 24
 
+    local row = Config.CHECKBOX_ROW
+
     Config.AddCheckbox(container, y, "Show the watch list on screen",
         function() return display.showList end,
         function(value)
             display.showList = value
             Silencer:OptionsChanged()
         end)
-    y = y - 26
+    y = y - row
 
     Config.AddCheckbox(container, y, "List group members wearing a Neural Silencer",
         function() return display.showWearers end,
@@ -449,7 +442,7 @@ function Silencer.BuildOptions(container, moduleId, moduleSettings, y)
             display.showWearers = value
             Silencer:OptionsChanged()
         end)
-    y = y - 26
+    y = y - row
 
     Config.AddCheckbox(container, y, "List group members targeting you (needs group target syncing)",
         function() return display.showWatchers end,
@@ -457,7 +450,7 @@ function Silencer.BuildOptions(container, moduleId, moduleSettings, y)
             display.showWatchers = value
             Silencer:OptionsChanged()
         end)
-    y = y - 26
+    y = y - row
 
     local note = container:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     note:SetPoint("TOPLEFT", 0, y)
@@ -466,7 +459,9 @@ function Silencer.BuildOptions(container, moduleId, moduleSettings, y)
     note:SetText("Wearing a Neural Silencer is never announced on its own - joining a raid " ..
         "should not fill chat with a roll call. Wearers appear here, and in the alert " ..
         "when somebody tries a Swapblaster, Life Grip or Rescue on one.")
-    y = y - 42
+    -- Measured: the note wraps, and a row count guessed against one player's
+    -- window width puts the button underneath the text on another's.
+    y = y - note:GetStringHeight() - 8
 
     local isDragging = false
     local positionBtn = CreateFrame("Button", nil, container, "UIPanelButtonTemplate")
@@ -496,7 +491,7 @@ function Silencer.BuildOptions(container, moduleId, moduleSettings, y)
         "prints what it can read. A Neural Silencer blocks Swapblaster and Life Grip, so a protected " ..
         "caster is the one group member who cannot be moved back."
     )
-    return y - 60
+    return y - help:GetStringHeight() - 4
 end
 
 -- ============================================================================
@@ -508,13 +503,18 @@ local function Initialize()
 
     local settings = GetSettings()
 
-    for _, id in ipairs(GetWatchedSpellIDs(settings)) do
-        local info = C_Spell.GetSpellInfo(id)
-        if info and info.name then
-            Tattle.silencerNames[info.name] = true
-            Tattle.DebugPrint("  Neural Silencer:", info.name, "(" .. id .. ")")
+    -- Deliberately not Tattle.ResolveSpellNames, even though that is what the cast
+    -- modules use for the same job: registering a name with the core also asks it
+    -- to dispatch that spell's cast events, and "Neural Silencer" is an aura this
+    -- module reads off a unit, never a cast to react to. So the lookup is spelled
+    -- out here, into the one shared set every module reads.
+    for _, id in ipairs(Tattle.MakeSpellIDs(MODULE_ID, SILENCER_SPELL_IDS)) do
+        local name = Tattle.ResolveSpellName(id)
+        if name then
+            Tattle.silencerNames[name] = true
+            Tattle.DebugPrint("  Neural Silencer:", name, "(" .. tostring(id) .. ")")
         else
-            Tattle.DebugPrint("  WARNING: Neural Silencer spell ID", id, "not found")
+            Tattle.DebugPrint("  WARNING: Neural Silencer spell ID", id, "is not in this client's spell database")
         end
     end
 
