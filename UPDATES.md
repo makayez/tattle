@@ -12,8 +12,12 @@ CurseForge project 1782380 through `## X-Curse-Project-ID` in `Tattle.toc`. The 
 verified to contain the 12.x addon and nothing else: four modules, core, config, screen
 alert, event listener, the TOC, the TGA and nothing from `Tests` or `Tools`
 
-**Still missing**: a CurseForge API token in the repository secrets. Without it the packager
-skips CurseForge and publishes GitHub only, which is what this release did
+**Now also true**: the repository secret exists, so the same run uploaded the file to
+CurseForge project 1782380 (`Uploading Tattle-v0.2.0-alpha.1.zip (12.0.1,12.0.0 alpha)
+to https://wow.curseforge.com/projects/1782380 - Success!`). The first cut of the tag did
+not: its workflow read the token from a secret named `CF_API_KEY`, the secret is
+`CF_API_TOKEN`, and the packager logged an empty token and skipped CurseForge. Moving the
+token-agnostic workflow into the tagged commit and re-cutting the tag fixed it
 
 ### Renamed: Snitch -> Tattle
 **Before**: the addon, its folder, its chat command (`/snitch`), its global and its

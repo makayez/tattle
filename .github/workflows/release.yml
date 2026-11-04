@@ -4,7 +4,7 @@ name: Release
 # BigWigsMods/packager, creates the GitHub release for the tag, and uploads the
 # zip to CurseForge using the ## X-Curse-Project-ID in Tattle.toc.
 #
-# CurseForge is skipped when the CF_API_KEY secret is missing: the GitHub release
+# CurseForge is skipped when neither token secret is set: the GitHub release
 # still happens, so the tag pipeline works before the CurseForge key is wired up.
 on:
   push:
