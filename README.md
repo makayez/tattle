@@ -213,6 +213,9 @@ CurseForge publishing needs a CurseForge API token (created at authors.curseforg
 
 ## Development
 
+The repository, not the packaged addon: the release zip ships the files above the
+`Tests/` line and nothing below it.
+
 ```
 Tattle.toc              load order, interface versions, saved variables, CurseForge project ID
 Core.lua                settings, the event frame, the cast-event filter, alert routing,
