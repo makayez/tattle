@@ -2,6 +2,37 @@
 
 All notable changes to Tattle will be documented in this file.
 
+## [Unreleased]
+
+A review pass over the whole addon: what the code claims, what it costs, and what
+is left in it that nothing calls. One user-visible bug, which the harness could
+not see until the harness was made to model a raid correctly.
+
+### Fixed
+- **The addon read you twice in a raid.** In a raid you hold one of the `raidN` indexes and `GetNumGroupMembers()` counts you; a party calls you `player` and numbers only the other four. `GroupUnitTokens` enumerated `raidN` up to the member count *and* appended `player`, so inside a raid you were scanned twice, and every group-wide sentence gained a second copy of you: the watch list said `you and you`, a blocked cast said `because you and you are using a Neural Silencer`, a Life Grip that landed on you read `used Life Grip on you and you`, and an Evoker who Rescued Pancakes was reported as also having been rescued by themselves. Unit tokens that might name you are now compared with `UnitIsUnit` (`Tattle.IsYou`, `Tattle.IsSameUnit`) rather than with `==`, which is also the safe way to compare a token that could be a secret value
+- **A module registered after `ADDON_LOADED` was left half wired**: no settings, and its declared events were never installed as listeners, because the core registers events once at start-up and had no second chance. `RegisterModule` now initialises its settings and rebuilds the listener table, so a late module works or is loudly broken rather than quietly doing nothing
+- **The config panel's height was a constant** (`700`) picked when the addon had fewer options in it, and tabs are not clipped - the next option added to the tallest tab would have spilled its spell ID editor over the bottom of the window. Each tab builder now reports the depth it used and the window is built around the deepest one
+- **The two sliders on the Screen Alerts tab indexed a widget that was never there.** `OptionsSliderTemplate` supplies its low/high labels as `$parentLow` / `$parentHigh`, which only exist as reachable widgets when the slider is created *named* - Tattle's sliders are anonymous, so `slider.Low:SetText(...)` reads a nil field and indexing it aborts the panel build. The end labels are now created by `AddSlider` itself, which also means they are positioned by the same code that positions the value readout. A stub that answers every unknown key with a no-op cannot catch this class of mistake, which is why it survived until the widget audit was tightened
+
+- `PlaySound` behind the Screen Alerts tab's *Test Sound* button is now guarded like the real alert path, so a `SOUNDKIT` constant that a patch renames prints a line instead of raising an error dialog
+
+### Changed
+- **One event owner.** `EventListener.lua` is gone. `Core.lua` creates the single event frame, registers `ADDON_LOADED`, `GROUP_ROSTER_UPDATE` and the cast events its modules ask for, and does the cast filtering there. Two frames used to register the same six cast events, and a module's own event list was registered by a third file's loop over a table it did not own
+- **Combat policy belongs to the core and is spelled once.** Registration takes `outOfCombat = "all"` (drop every event of a cast whose caster is fighting - what an instant spell wants) or `"start"` (drop only the cast/channel starts, so a swap begun out of combat is still announced when it lands). The old boolean `outOfCombatOnly` meant the second and could only mean the second, which is why Life Grip and Rescue each carried a private copy of the first. The core asks the caster's combat state at most once per event, and only when a listening module asked for the rule at all
+- **Life Grip and Rescue are one file**: `Modules/CastSpells.lua` registers both from one table-driven factory. They differ in their spell IDs and in the word that goes in the sentence, and the two files differed in nothing else for 300 lines
+- **`Core.lua` shed three files' worth of work**: `/tattle probe` is now `Probe.lua`, the chat command is `Commands.lua`, and the spell ID editor is `ConfigSpellIDs.lua`. What is left in the core is what more than one module needs
+- **`Tattle.ShouldReport` became `Tattle.ScopeDrops`.** It answered a three-valued question with a boolean whose polarity each caller had to remember; now the name says what `true` means, and "we cannot prove who it hit" is written as `nil` and documented as never being a reason to stay quiet
+- **The per-module spell boilerplate moved into the core**: `Tattle.MakeSpellIDs` (what the player typed, or what ships), `Tattle.ResolveSpellNames` (IDs to names, registered with the dispatcher), `Tattle.MakeSpellMatcher` (the name-or-ID test every handler started with). Three copies of each came out
+- Module and listener order comes from `Tattle.moduleOrder` everywhere, so `pairs()` cannot reshuffle initialisation or alert order between sessions
+- `Config:GetSlider` - a method that used no state - is the plain function `AddSlider`; the row rhythm the shared controls assume is published as `Config.CHECKBOX_ROW` / `Config.DROPDOWN_ROW` so a module laying out its own tab extras steps by the same amount; `Modules/Silencer.lua` measures its wrapped notes with `GetStringHeight` instead of guessing row counts
+- **Dead code removed**: `Config:RegisterModuleTab` and the per-module `buildContent` hook (no module ever supplied one, so tabs were built by one function through an indirection), `ScreenAlert:RegisterEditMode` (never called - and `FEATURES.md` was telling people it existed), the `Tattle.WatchedSpellNames` mutable export, `Tattle.IsInRaidGroup` / `Tattle.IsRaidMemberToken` aliases, `Silencer.GetWatchedSpellIDs`, `module.buildContent` in the registration shape
+- Every addon file now opens with `local _, Tattle = ...` and receives the namespace table the core created, so the only globals the addon leaves in the client are `TattleDB` and the slash command entry
+
+### Notes
+- **The stub now models a raid the way the client numbers one**: you hold a raid index, `GetNumGroupMembers()` counts you, and an aura on you is readable through either of your tokens. That is what made the double-count fix testable - with the self-exclusion removed from `GroupUnitTokens`, five checks fail, one of which reads `it failed because you and you are using a Neural Silencer`. Checks went from 97 to 106, adding coverage for the unit-token list, the watcher sweep's own entry, protected-person naming, Rescue's self-mark, late module registration, and the `allCasters` opt-out (which had none)
+- **The harness now fails when a widget setter is handed `nil`** where the client demands a number. It previously shrugged at `panel:SetSize(700, nil)` - an error on a real client - because its setters type-checked and dropped what they did not understand
+- `README.md` gained the file layout and what each file is for; `PROJECT_SUMMARY.md`, `FEATURES.md` and the config panel's own About text no longer describe the pre-review addon
+
 ## [0.2.0-alpha.2] - 2026-11-04
 
 ### Changed

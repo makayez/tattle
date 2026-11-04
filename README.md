@@ -49,7 +49,7 @@ Tattle provides **per-module** alert configuration. Each module can have its own
 - **Monitor scope**: `Whole group` (any group member's cast) or `Only me` (drop a cast only when it can be proven it missed you)
 - **Console Output**: Print messages to your chat window
 - **Chat Messages**: Send alerts to /say, /yell, /party, /raid or instance chat, or keep them private (configurable per module). `Raid` and `Party` are resolved against the group you are actually in, so announcements land in a **Looking for Raid** raid as well - a plain `RAID` send there goes nowhere
-- **Combat awareness**: all three detectors ignore a cast made *in combat* - a mid-fight Life Grip or Rescue is somebody's emergency cooldown, and the Swapblaster toy cannot be used in combat at all. The mechanisms differ: Swapblaster is flagged `outOfCombatOnly`, so the core skips its cast **starts** while the caster is fighting (a swap that begins out of combat is still announced when landing it is what pulled), while Life Grip and Rescue each check `UnitAffectingCombat` on both the start and the success
+- **Combat awareness**: nothing is announced while the caster is fighting. A mid-fight Life Grip or Rescue is somebody's emergency cooldown doing its job, and the Swapblaster toy cannot be used in combat at all. Each module declares which of its events the rule applies to - `outOfCombat = "all"` for the instant grab spells, `outOfCombat = "start"` for the Swapblaster, whose *landing* is still announced because a swap you began while walking can pull you into the fight - and the core applies the rule, so no module carries its own combat check
 - **Audio Alerts**: Play customizable sound effects when events occur (5 sounds to choose from)
 - **Screen Warnings**: Fully customizable on-screen alerts with:
   - Adjustable font and font size
@@ -105,7 +105,13 @@ Tattle uses a modular architecture to make adding new detection modules easy. Ea
 - Sends alerts through the unified alert system
 - Gets its own tab in the config panel automatically
 
-Registration also accepts three flags the core honours: `outOfCombatOnly` (skip cast *starts* while the caster is fighting), `noScope` (this module filters no casts, so its tab omits the Monitor control), and `extraContent` (a function that adds the module's own options to its tab).
+Registration also accepts three flags the core honours:
+
+- `outOfCombat` - `"all"` to drop every event of the cast while its caster is fighting (what an instant spell wants), or `"start"` to drop only the cast/channel *starts* (what a spell with a travel time wants, because its completion can arrive after combat began). The core asks the caster's combat state at most once per event, and only if some listening module asked for the rule.
+- `noScope` - this module filters no casts, so its tab omits the Monitor control it would ignore.
+- `extraContent` - a function that adds the module's own options below the shared alert controls on its tab.
+
+`allCasters` is the fourth, and you probably do not want it: it opts the module out of the core's group-member filter, so casts by pets, minions and NPCs reach it too.
 
 ### Creating a New Module
 
@@ -116,7 +122,7 @@ To add a new detection module:
 3. Implement detection logic in the event handler
 4. Add the file to `Tattle.toc`
 
-See `Modules/Rescue.lua` for the smallest complete example.
+See `Modules/CastSpells.lua` for the two cast detectors - Life Grip and Rescue are the same shape, so one table-driven factory registers both - and `Modules/Silencer.lua` for a module that reads auras instead of casts.
 
 ## Technical Details
 
@@ -131,7 +137,7 @@ Midnight 12.0.0 removed `COMBAT_LOG_EVENT_UNFILTERED` (registering it now raises
 
 There is no `OnUpdate` anywhere in the addon, so nothing runs per frame and there is no GPU work beyond the two text frames (`TattleScreenAlertFrame` while an alert is up, and the optional watch list). Everything the addon does is event-driven. What that costs:
 
-- **Cast events are the only noisy input.** In a fight the client reports every raid member's every cast, plus their pets, minions and totems. The core asks the cheapest question first - is this caster one of our players? - and only then resolves the spell name **once per event** with `C_Spell.GetSpellName` (a plain string - no table allocated), dropping the event unless a module registered that name. Three modules used to each call `C_Spell.GetSpellInfo` on every cast, which is three API calls and three thrown-away tables per cast; the harness asserts exactly one resolution per cast event, and that a pet or NPC cast costs none at all.
+- **Cast events are the only noisy input.** In a fight the client reports every raid member's every cast, plus their pets, minions and totems. The core asks is-this-caster-one-of-our-players first and then resolves the spell name **once per event** with `C_Spell.GetSpellName` (a plain string - no table allocated), dropping the event unless a module registered that name. The caster is asked first not because it is cheaper but because it is the safe question: a spell name derived from a secret spell ID cannot be used as a table key in restricted content, while the unit queries are documented to accept secret values. Three modules used to each call `C_Spell.GetSpellInfo` on every cast, which is three API calls and three thrown-away tables per cast; the harness asserts exactly one resolution per cast event, and that a pet or NPC cast costs none at all.
 - **Four gates run before any module code**: addon enabled, grouped, spell name watched by somebody, caster is a group member. Out of a group the addon does nothing at all.
 - **Aura and target scans are cached and throttled.** The group's unit token lists (`Tattle.GroupUnitTokens` / `GroupTargetEntries`) are built once and dropped on `GROUP_ROSTER_UPDATE`, so a watch-list sweep allocates nothing. Scans are driven by `UNIT_AURA` / `UNIT_TARGET` plus a 0.5 s ticker, throttled to no faster than every 0.25 s - about four sweeps of ~25 aura lookups a second at the ceiling, and only while the watch list is switched on. The frame is re-measured only when its text actually changed.
 - **Nothing is created until it is needed.** The config panel (~200 widgets) is built the first time you open `/tattle`, not at login; the watch list frame and its timer are created when you tick them and the timer is cancelled when you untick them.
@@ -147,7 +153,8 @@ The addon only processes cast events when:
 - The caster is one of your group's **players**. Nothing Tattle watches can come from anything else - the Swapblaster is a toy and Life Grip, Leap of Faith and Rescue are player spells - so a hunter's pet, a warlock's minion, a totem and every NPC are rejected before their spell is even named. Membership includes you, which the `partyN` / `raidN` tokens do not
 - The cast is a spell some module registered (`Tattle.WatchSpellNames`)
 - The module's `Monitor` scope allows the cast
-- For the Swapblaster only: the caster is not in combat. A swap that began out of combat is still announced even if landing it is what started the fight
+- The module's combat policy allows the cast (`outOfCombat`). Both grab spells are judged at every phase - one that resolves mid-fight is a raid tool, not a mugging. The Swapblaster is judged only at its **start**, so a swap you began out of combat is still announced even if landing it is what started the fight
+- Nothing Tattle watches is announced for a caster who is not one of your group's players, which is why `allCasters` exists but is off by default
 
 ### Verifying spell IDs
 
@@ -205,12 +212,33 @@ CurseForge publishing needs a CurseForge API token (created at authors.curseforg
 
 ## Development
 
-Built following WoW addon best practices:
-- Modular architecture for maintainability
-- Localized globals for performance
-- Error handling with pcall
-- Efficient event filtering
-- Clean separation of concerns
+```
+Tattle.toc              load order, interface versions, saved variables, CurseForge project ID
+Core.lua                settings, the event frame, the cast-event filter, alert routing,
+                        group/aura/silencer helpers - everything more than one module needs
+Probe.lua               /tattle probe: what your client actually exposes
+Commands.lua            the /tattle slash command
+ScreenAlert.lua         the on-screen alert frame (created on first use)
+Config.lua              the config panel, its shared controls, one tab per module
+ConfigSpellIDs.lua      the per-module spell ID editor
+Modules/Swapblaster.lua Swapblaster detection
+Modules/CastSpells.lua  Life Grip and Rescue, from one factory
+Modules/Silencer.lua    Neural Silencer: the shared protection lookup + watch list
+Tests/wow_stub.lua      a stub WoW client and ~106 checks; loads the addon in TOC order
+Tools/                  make_icon.py, the procedural Tattle Turtle
+```
+
+Every file opens with `local _, Tattle = ...` and receives the same table the core
+created, so the only globals the addon leaves behind are `TattleDB` (saved
+variables) and the slash command. Load order in `Tattle.toc` is the dependency
+list: Core first, everything else after it.
+
+Run the checks with `lua Tests/wow_stub.lua` (Lua 5.1; CI installs `lua5.1`). It
+is a real harness, not a mock of what the code should do: it models raid tokens
+the way the client numbers them, counts API calls so a claim about cost is
+asserted rather than asserted, and fails if a widget is handed a `nil` where the
+client demands a number. If you change what an alert says, change the check that
+quotes it.
 
 ## Version
 

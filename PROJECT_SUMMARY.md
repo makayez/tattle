@@ -127,9 +127,12 @@ Tattle:RegisterModule("moduleId", {
     spellIDs    = { 123456 },              -- feeds the tab's spell ID editor
 
     -- Optional flags the core honours:
-    outOfCombatOnly = true,  -- skip cast starts while the caster is fighting
-    noScope         = true,  -- this module filters no casts; tab omits Monitor
-    extraContent    = function(container, moduleId, moduleSettings, y) return y end,
+    outOfCombat = "all",     -- "all" drops every event of a cast whose caster is
+                             -- fighting; "start" drops only the cast/channel
+                             -- starts, so a slow spell's landing still arrives
+    noScope     = true,      -- this module filters no casts; tab omits Monitor
+    allCasters  = true,      -- opt out of the core's group-member filter (rarely right)
+    extraContent = function(container, moduleId, moduleSettings, y) return y end,
 })
 ```
 
@@ -184,27 +187,36 @@ Target detection depends entirely on whether the spell marks its victim:
 To add a new detection module (e.g., hunter pet detection):
 
 1. Create `Modules/YourModule.lua`
-2. Follow the Rescue.lua pattern (or Modules/Silencer.lua for a module that watches auras rather than casts):
+2. Follow the `Modules/CastSpells.lua` pattern (or `Modules/Silencer.lua` for a module that watches auras rather than casts):
    ```lua
    local MODULE_ID   = "yourmodule"
    local MODULE_NAME = "Your Module Name"
 
-   -- Resolve the watched IDs to names once, at Initialize(); cast events hand
-   -- over secret spell IDs that can only be matched by name.
-   local watchedNames = {}
+   local names     = {}   -- spell names, filled in Initialize
+   local isOurCast        -- the matcher, built in Initialize below
 
-   -- The core resolves the spell name once per event and only wakes modules that
-   -- registered the name (Tattle.WatchSpellNames, called from Initialize). Take
-   -- the fifth argument; only a caller without a resolved name needs the API.
+   -- Cast events hand over spell IDs that are secret values inside instances, so a
+   -- module matches by spell name. Initialize is where the IDs you ship (or the
+   -- ones the player typed over them) become names, and where those names are
+   -- handed to the core -- which then resolves each event's spell name once and
+   -- wakes only the modules that registered it.
+   local function Initialize()
+       Tattle.ResolveSpellNames(names, Tattle.MakeSpellIDs(MODULE_ID, { 123456 }))
+       isOurCast = Tattle.MakeSpellMatcher(names)
+   end
+
+   -- The core already dropped casts by anyone outside your group and every spell
+   -- nobody registered, so the handler is a decision, not a filter. The membership
+   -- line stays as a guard: that filter is per-event, and another module's
+   -- allCasters flag widens the same event for everybody.
    local function OnEvent(event, unitToken, castGUID, spellID, spellName)
        if not Tattle.IsGroupMemberToken(unitToken) then return end
-       if spellName then
-           if not watchedNames[spellName] then return end
-       else
-           local name = Tattle.ResolveSpellName(spellID)
-           if not name or not watchedNames[name] then return end
-       end
-       if Tattle.ShouldReport(MODULE_ID, unitToken) == false then return end
+       if not isOurCast(spellName, spellID) then return end
+
+       -- ScopeDrops answers "is this outside the Monitor scope?" The third
+       -- argument is the victims you positively identified; nil means "unknown",
+       -- and an unknown is never proof that a cast missed you.
+       if Tattle.ScopeDrops(MODULE_ID, unitToken, nil) then return end
 
        Tattle.SendAlert("Message", MODULE_ID)
    end
@@ -214,7 +226,7 @@ To add a new detection module (e.g., hunter pet detection):
        description = "What it detects",
        onEvent     = OnEvent,
        initialize  = Initialize,
-       spellIDs    = { 123456 },
+       spellIDs    = { 123456 },   -- what the tab's spell ID editor starts from
        events      = { "UNIT_SPELLCAST_SUCCEEDED" },
    })
    ```
@@ -253,16 +265,18 @@ Potential improvements:
 
 ```
 tattle/
-├── Tattle.toc              # Addon descriptor
-├── EventListener.lua       # Creates the event frame (loads first)
-├── Core.lua                # Main addon logic
+├── Tattle.toc              # Addon descriptor, load order, CurseForge project ID
+├── Core.lua                # Settings, the event frame, cast filtering, alerts,
+│                           #   group/aura/silencer helpers (loads first)
+├── Probe.lua               # /tattle probe
+├── Commands.lua            # the /tattle slash command
 ├── ScreenAlert.lua         # Custom screen alerts
-├── Config.lua              # Configuration UI
+├── Config.lua              # Configuration UI (shared controls, one tab per module)
+├── ConfigSpellIDs.lua      # Per-module spell ID editor
 ├── Modules/
 │   ├── Swapblaster.lua     # Swapblaster detection
-│   ├── LifeGrip.lua        # Life Grip (Leap of Faith) detection
-│   ├── Rescue.lua          # Rescue detection
-│   └── Silencer.lua        # Neural Silencer scan, alerts and watch list
+│   ├── CastSpells.lua      # Life Grip and Rescue, from one factory
+│   └── Silencer.lua        # Neural Silencer lookup and watch list
 ├── Tests/
 │   └── wow_stub.lua        # Stub client harness (CI and local)
 ├── README.md               # User documentation

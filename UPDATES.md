@@ -1,5 +1,34 @@
 # Recent Updates
 
+### The review pass: one event frame, and the addon was reading you twice
+**Before**: `EventListener.lua` and `Core.lua` each created an event frame and
+both registered the same six cast events; Life Grip, Rescue and Swapblaster each
+carried their own combat check and their own spell-ID-to-name boilerplate;
+`Core.lua` was 1.2k lines and included the probe and the slash command
+
+**Now**: the core owns the one event frame and the cast filter, and spells the
+combat rule once (`outOfCombat = "all"` for the grab spells, `"start"` for the
+Swapblaster, whose landing still arrives because a swap begun while walking can be
+what pulls you into the fight). `EventListener.lua` is deleted, Life Grip and
+Rescue are one table-driven file (`Modules/CastSpells.lua`), and the probe, the
+slash command and the spell ID editor are their own files. The only globals left
+are `TattleDB` and the slash command
+
+**The bug**: in a raid you hold one of the `raidN` indexes *and* you are `player`,
+and the core's group token list appended both - so you were scanned twice. The
+watch list said `you and you`; a blocked cast said `it failed because you and you
+are using a Neural Silencer`; a Life Grip on you read `on you and you`; and an
+Evoker who Rescued somebody was reported as their own passenger
+
+**Why it took this long**: the stub harness modelled a raid of two as `raid1` and
+`raid2` being other players, which is not a shape the game can produce. Fixing the
+model turned the bug into five failing checks, and deleting the core's
+double-counting turned them green again - the fix is pinned by checks, not by a
+comment. Checks went 97 to 106, and the harness now also fails if a widget setter
+is handed `nil` where the client wants a number, which is how `SetSize(700, nil)`
+slipped past it once
+
+
 ### 0.2.0-alpha.1 is out
 **Before**: the work since the last tag sat in the tree - the rename, the Neural Silencer
 module, the performance pass, the LFR chat fix, the icon - and there was no CurseForge

@@ -240,26 +240,28 @@ A: Turn on "List group members targeting you" on the Silencers tab. It reads eac
 **Q: Why does the probe print nothing when I am solo?**
 A: By design. Nothing it measures - a swap, a grip, a rescue - can happen without a group, and the aura and target sweeps it would run are pure waste when you are alone.
 
-**Q: Can I see Edit Mode integration?**
-A: Basic Edit Mode registration is implemented but full integration would require more development.
+**Q: Can I move the alerts in Edit Mode?**
+A: No - Tattle does not register with Edit Mode, because the two frames that can appear on screen are invisible most of the time, and Edit Mode is for frames you can see in order to position them. Each has a **Reposition** button instead (Screen Alerts tab, Silencers tab), which makes the frame movable so you can drag it, and the position is saved per option.
 
 **Q: How do I add a new module?**
-A: See `Modules/Swapblaster.lua` as template. Create new file, register module, add to .toc, reload.
+A: See `Modules/CastSpells.lua` (cast detectors - Life Grip and Rescue are one factory registered twice) or `Modules/Swapblaster.lua` (a channeled spell with a backfire to interpret). Create the file, register it with `Tattle:RegisterModule`, add it to `Tattle.toc` after Core.lua, `/reload`.
 
 ## File Structure
 
 ```
 tattle/
 ├── Tattle.toc           - Addon descriptor & file list
-├── EventListener.lua    - Creates the event frame (must load first)
-├── Core.lua             - Main framework, alert system, silencer & chat helpers
+├── Core.lua             - Settings, the event frame, cast filtering, alert system,
+│                          silencer / group / chat helpers (loads first)
+├── Probe.lua            - /tattle probe
+├── Commands.lua         - the /tattle slash command
 ├── ScreenAlert.lua      - Custom screen alert system
 ├── Config.lua           - Main configuration UI (tabbed, shared module-tab sections)
+├── ConfigSpellIDs.lua   - Per-module spell ID editor
 ├── Modules/
 │   ├── Swapblaster.lua  - Swapblaster detection module
-│   ├── LifeGrip.lua     - Life Grip (Leap of Faith) detection module
-│   ├── Rescue.lua       - Rescue detection module
-│   └── Silencer.lua     - Neural Silencer scan, announcements and watch list
+│   ├── CastSpells.lua   - Life Grip and Rescue detection modules
+│   └── Silencer.lua     - Neural Silencer lookup, blocked-cast wording, watch list
 ├── Tests/
 │   └── wow_stub.lua     - Stub WoW client harness (CI + local)
 ├── README.md            - User documentation
