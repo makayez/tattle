@@ -201,7 +201,7 @@ To ship a version:
 
 The tag must be **annotated** (`git tag -a`), because the packager reads the version from the tag and builds the changelog from the commits between tags.
 
-CurseForge publishing needs a CurseForge API token (created at authors.curseforge.com, account settings -> API tokens) stored as the repository secret `CF_API_KEY`. Without that secret the CurseForge upload is skipped and everything else still runs - in which case download `Tattle-<version>.zip` from the GitHub release and upload it on the project's files page by hand.
+CurseForge publishing needs a CurseForge API token (created at authors.curseforge.com, account settings -> API tokens) stored as a repository secret named `CF_API_TOKEN` (the packager's own name for it; `CF_API_KEY` is accepted too). Without that secret the CurseForge upload is skipped and everything else still runs - in which case download `Tattle-v<version>.zip` from the GitHub release and upload it on the project's files page by hand.
 
 ## Development
 

@@ -30,9 +30,10 @@ jobs:
         env:
           GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}
 
-          # CurseForge project API key, created at authors.curseforge.com under
-          # account settings -> API tokens, stored as a repository secret named
-          # CF_API_KEY. The packager docs name the variable CF_API_TOKEN and the
-          # action also accepts CF_API_KEY, so both are supplied from one secret.
-          CF_API_KEY: ${{ secrets.CF_API_KEY }}
-          CF_API_TOKEN: ${{ secrets.CF_API_KEY }}
+          # CurseForge API token, created at authors.curseforge.com under
+          # account settings -> API tokens, stored as a repository secret.
+          # The packager documents the variable as CF_API_TOKEN; the Action wiki
+          # example names it CF_API_KEY, so the secret is accepted under either
+          # name and both variables are set from it.
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN || secrets.CF_API_KEY }}
+          CF_API_KEY: ${{ secrets.CF_API_TOKEN || secrets.CF_API_KEY }}
