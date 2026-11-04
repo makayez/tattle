@@ -164,7 +164,7 @@ That is also why this addon can name a grip's victim when older, combat-log-base
 
 ## Compatibility
 
-- **World of Warcraft retail 12.x** (Midnight). `## Interface: 120001, 120000`; built and spell-checked against **12.1.5**.
+- **World of Warcraft retail 12.1.x** (Midnight). `## Interface: 120107, 120105` - 12.1.7 and 12.1.5. Built and spell-checked against **12.1.5**.
 - No libraries, no data feeds, no addons required, no `/who`-style scanning, no comms. Nothing leaves your client and nothing is collected.
 - Saved variables: `TattleDB`.
 - **Tattle used to be called Snitch.** The rename carried the folder, chat command, frames and saved-variable name with it, and saved variables are stored per addon folder — so settings from an old *Snitch* install do not migrate on their own. Either re-tick what you had, or copy `WTF/Account/<account>/SavedVariables/Snitch.lua` over `Tattle.lua` and rename the variable inside. **`/tattle` is the only command**: the old spelling is not registered at all, so a stale `/snitch` macro fails visibly instead of half-working behind an alias nobody documents.

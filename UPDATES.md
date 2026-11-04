@@ -32,6 +32,19 @@ another's file, so configuration starts fresh. To keep yours, copy
 `WTF/Account/<account>/SavedVariables/Snitch.lua` over `Tattle.lua` and rename the
 top-level variable inside it
 
+### Supported interface moved to 12.1.x
+**Before**: `## Interface: 120001, 120000` - the 12.0 line
+
+**Now**: `## Interface: 120107, 120105` - 12.1.7 and 12.1.5, the same pair the other
+addon in this family declares. No Lua changed: a scan of every global the addon calls
+came back as cast/aura/target events, `C_Spell` lookups, `C_UnitAuras`, the group
+queries, `C_Timer`, `PlaySound`, `SendChatMessage` and the widget/Settings API - none of
+which moved between 12.0 and 12.1, and there is no `GetBuildInfo` branch to update
+
+**Why it needs a release, not just a commit**: CurseForge stamps a file's supported game
+versions from `## Interface` when the file is uploaded. The alpha.1 file is filed under
+12.0.1/12.0.0 for good, so the label only moves by publishing a new file
+
 ## Major Changes
 
 ### Per-Module Alert Configuration 

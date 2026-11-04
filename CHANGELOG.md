@@ -2,6 +2,16 @@
 
 All notable changes to Tattle will be documented in this file.
 
+## [0.2.0-alpha.2] - 2026-11-04
+
+### Changed
+- **Supported interface is now 12.1.x: `## Interface: 120107, 120105`** (12.1.7 and 12.1.5). The 12.0 line is dropped, matching the other addon in this family; a client still on 12.0.x will list Tattle as out of date rather than load an unsupported build
+- **No Lua changed.** Everything the addon touches is stable across the 12.0 to 12.1 point releases: `UNIT_SPELLCAST_*` / `UNIT_AURA` / `UNIT_TARGET` events, `C_Spell.GetSpellName` and `C_Spell.GetSpellInfo`, `C_UnitAuras.GetAuraDataBySpellName`, `UnitCastingInfo` / `UnitChannelInfo`, the group and membership queries, `C_Timer`, `PlaySound`, `SendChatMessage`, the widget API, `C_AddOns.GetAddOnMetadata` and the two `Settings.Register*Category` calls. Nothing version-gated, and no `GetBuildInfo` branch anywhere in the addon - so this is a compatibility declaration, not a port
+
+### Notes
+- **Why a version bump for one TOC line.** CurseForge takes a file's supported game versions from `## Interface` at upload time; the alpha.1 file is filed under 12.0.1 and 12.0.0 and cannot be relabelled. A new file is the only way a 12.1 player sees a supported version, and the packager reads the version from the tag, so the tag is how the metadata moves
+- Also in this build, from commits after the alpha.1 tag: the `## License` section and corrected requirement in `README.md`, the license line in `DESCRIPTION.md` and `CURSEFORGE.md`, and the devlog's account of how the CurseForge upload came to work
+
 ## [0.2.0-alpha.1] - 2026-11-03
 
 ### Added

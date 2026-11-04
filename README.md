@@ -183,7 +183,7 @@ editing numbers and re-running, not by pushing pixels.
 
 ## Requirements
 
-- World of Warcraft retail 12.x. `Tattle.toc` accepts the interface values `120001` and `120000`
+- World of Warcraft retail 12.1.x. `Tattle.toc` declares the interface values `120107` (12.1.7) and `120105` (12.1.5). The 12.0 line was dropped, so a client still on 12.0.x will list Tattle as out of date
 - No dependencies, no saved-game addons, no extra libraries
 
 ## Releases & CI
@@ -197,7 +197,7 @@ To ship a version:
 
 1. Bump `## Version` in `Tattle.toc`, and turn the `## [Unreleased]` heading in `CHANGELOG.md` into `## [<version>] - <date>`
 2. Run the harness: `lua Tests/wow_stub.lua`
-3. Tag and push: `git tag -a v0.2.0-alpha.1 -m "Tattle 0.2.0-alpha.1"` then `git push origin main v0.2.0-alpha.1`
+3. Tag and push: `git tag -a v0.2.0-alpha.2 -m "Tattle 0.2.0-alpha.2"` then `git push origin main v0.2.0-alpha.2`
 
 The tag must be **annotated** (`git tag -a`), because the packager reads the version from the tag and builds the changelog from the commits between tags.
 
