@@ -3,7 +3,7 @@
 ## IconTexture: Interface\AddOns\Tattle\TattleTurtle
 ## Notes: Alerts when a group member uses Swapblaster, Life Grip or Rescue, and tracks the group's Neural Silencer wearers
 ## Author: Tarball-Whisperwind [A]
-## Version: 0.2.0-alpha.2
+## Version: 0.2.0-alpha.3
 ## SavedVariables: TattleDB
 
 ## X-Curse-Project-ID: 1782380

@@ -53,14 +53,14 @@ It watches four things, alerts on three of them, and stays quiet on the fourth o
 
 | Module | Spell | Out of combat | Who gets named |
 |---|---|---|---|
-| **Swapblaster** | `161399` — the game names the cast *"Swap"*, from the item *Swapblaster* (111820) | yes | the caster only |
+| **Swapblaster** | `161399` — the game names the cast *"Swap"*, from the item *Swapblaster* (111820) | yes | the caster, plus whoever they had targeted |
 | **Life Grip** | `73325` — the game names it *Leap of Faith* (Priest) | yes | caster **and** the player pulled |
 | **Rescue** | `370666` (Evoker) | yes | caster **and** the passenger |
 | **Neural Silencer** | auras `156779` / `384129` (*"Immune to some annoyances"*, 12 hours) | n/a | whoever is wearing one, if you switch the list on |
 
-**Swapblaster** reports the 1.5 second cast when it starts (so you can turn around), when it lands, and when it was **cut short, failed or interrupted**. A swap marks nobody with an aura, so Tattle will not pretend to know who was swapped — it names the caster, which is the half you can act on.
+**Swapblaster** reports the 1.5 second cast when it starts (so you can turn around), when it lands, and when it was **cut short, failed or interrupted**. A swap marks nobody with an aura, so the other half comes from the caster's own target — the toy requires one (*Swaps your location with another party member*), and `COMBAT_LOG_EVENT_UNFILTERED` used to be the only thing that said where a spell was aimed. So you get *at Pancakes* while the cast runs and *on Pancakes* once it lands, and on a client that is not told other players' targets you get the caster's name and no claim about the rest.
 
-**Life Grip** and **Rescue** name their victim by reading the short aura the grab leaves on the player who was moved. That aura is the only destination information the 12.x API still exposes, and it is why these two can say *"on Donut"* while Swapblaster cannot.
+**Life Grip** and **Rescue** name their victim by reading the short aura the grab leaves on the player who was moved — actual evidence that the spell landed on a specific person, which is why those two are never guessing while Swapblaster is reading a target field.
 
 **All three ignore casts made in combat.** A Life Grip or a Rescue during a fight is somebody's emergency cooldown and is not news. A Swapblaster cast that *begins* out of combat is still announced even if the pull starts before it lands — that swap is exactly as mean as it looks.
 
@@ -71,8 +71,8 @@ It watches four things, alerts on three of them, and stays quiet on the fourth o
 Console output is tagged; chat messages are sent plain so they don't shout:
 
 ```
-[Tattle] Donut is casting Swapblaster
-[Tattle] Donut used Swapblaster
+[Tattle] Donut is casting Swapblaster at Pancakes
+[Tattle] Donut used Swapblaster on Pancakes
 [Tattle] Pancakes's Swapblaster was cut short
 [Tattle] Pancakes used Life Grip on you!
 [Tattle] Pancakes used Rescue on Donut!
@@ -89,7 +89,7 @@ Every module decides independently where its alerts go: console, chat channel, s
 A Neural Silencer makes its wearer immune to precisely the toys this addon watches. Tattle refuses to let that be quietly useful:
 
 - **A blocked grab is reported as a blocked grab.** A Life Grip or Rescue that resolved but marked nobody is a refusal, and the message says so and names the immune player.
-- **A backfired Swapblaster is reported too** (`182081`, *Swapblaster Explosion*). That spell is the only evidence a blocked swap attempt ever existed, because a swap that *lands* marks nobody either.
+- **A backfired Swapblaster is reported too** (`182081`, *Swapblaster Explosion*). That spell is the only evidence a blocked swap attempt ever existed, because a swap that *lands* marks nobody either. When the caster's target is readable, the alert names the immune player who set it off instead of hedging about "a protected group member".
 - **A protected caster gets called out.** Firing a Swapblaster while wearing a Silencer yourself cannot work, and gets: *`… is using a Neural Silencer - that's not fair!`*
 - **An optional on-screen watch list** (off by default, drag it where you want) shows the group's Silencer wearers and which group members currently have *you* targeted.
 
@@ -101,7 +101,7 @@ It will **never** announce that someone simply put one on. Wearing a buff is not
 
 Listed so nobody files it as a bug:
 
-- **Not who was swapped.** The Swapblaster's cast leaves no aura on either party. Caster only, every time.
+- **Not who was swapped, on a client that will not say.** The swap leaves no aura on either party, so the other half is read from the caster's target field. If your client is told, it is named; if it is not, the alert gives you the caster and stops. It never claims a swap with somebody the caster was not looking at.
 - **Nothing while you are solo.** Every ability it watches needs a group, so out of one there is nothing to detect and the addon does no work at all.
 - **Nothing about pets, minions, totems or NPCs.** None of them can cast any of these spells, so non-player casters are rejected before the spell is even named.
 - **Nothing while the addon is disabled** or while a module's own toggle is off.
@@ -157,7 +157,7 @@ There is **no `OnUpdate` anywhere in the addon**. Nothing runs per frame, nothin
 
 Two changes in Midnight made this kind of addon harder, and Tattle exists because of them:
 
-- **`COMBAT_LOG_EVENT_UNFILTERED` was removed** (registering it now raises `ADDON_ACTION_FORBIDDEN`). It was the only source of a spell's *destination*. Tattle substitutes **auras as destinations**: Life Grip and Rescue mark the player they moved, so the victim is recovered by scanning the group's auras — which 12.1 made readable out of combat again.
+- **`COMBAT_LOG_EVENT_UNFILTERED` was removed** (registering it now raises `ADDON_ACTION_FORBIDDEN`). It was the only source of a spell's *destination*. Tattle substitutes two things: **auras as destinations** (Life Grip and Rescue mark the player they moved, and 12.1 made group auras readable out of combat again) and, for a spell that marks nobody, **the caster's own target token**, read at the moment the cast starts.
 - **Spell IDs are secret values inside restricted content** — they can't be compared with `==`, printed, or used as a table key. Tattle therefore resolves its known IDs to spell names once at startup and compares the *name* the core hands each event, never the raw ID, with `pcall` around anything that might receive a secret.
 
 That is also why this addon can name a grip's victim when older, combat-log-based tools can no longer do it at all.
@@ -184,7 +184,7 @@ A grab that resolves and marks nobody left with an aura is a refusal, and the gr
 Yes, that's the point of per-module tabs.
 
 **The victim line says "on a protected group member" instead of a name. Why?**
-Several people in the group were immune, so naming one of them would be a guess.
+Two things had to be true to name one: several people in the group were immune, *and* your client was not telling you who the caster had targeted. With the target readable, the immune player they were looking at gets named. Without it, naming one of several immune members would be a guess.
 
 ---
 

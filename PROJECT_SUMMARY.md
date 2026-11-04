@@ -177,9 +177,9 @@ If a patch changes one, override it in the module tab's spell ID editor rather t
 
 ### Target Detection
 
-Target detection depends entirely on whether the spell marks its victim:
-- Life Grip (4 s "Leap of Faith" aura) and Rescue (3 s "Rescue" aura) are attributed by name, because 12.1.0 made group auras readable out of combat again
-- Swapblaster marks nobody, so its alerts report the caster only
+Two sources, in descending order of how much they prove:
+- **Auras.** Life Grip (4 s "Leap of Faith") and Rescue (3 s "Rescue") mark the player they moved, so those are attributed by name through `Tattle.AuraCarriers` - possible because 12.1.0 made group auras readable out of combat again
+- **`<caster>target`.** The Swapblaster marks nobody, so its other half is the group member the caster had targeted when the cast started, resolved by `Tattle.GroupMemberTargetOf`. It asks one `UnitExists` before it will spend a `UnitIsUnit` per raid member, and answers nil - "your client was not told" - rather than a guess
 - Rescue is instant and Leap of Faith is instant, so no cast-start event precedes them; the completion event must stand alone
 
 ## Adding New Modules

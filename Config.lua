@@ -342,8 +342,9 @@ local function BuildAboutTab(container)
         "A chat alert set to Raid is resolved against the group you are actually in, so it also lands in a Looking for Raid raid.\n\n" ..
         "Blizzard's 12.x rules shape what can be detected. COMBAT_LOG_EVENT_UNFILTERED was removed in 12.0.0, " ..
         "so no cast event says who another player's spell was aimed at, and inside instances the spell ID is a " ..
-        "secret value (Tattle matches spell names instead). Life Grip and Rescue put an aura on the victim, so " ..
-        "those can be attributed by name. Swapblaster marks nobody, so it is reported without a victim. Run " ..
+        "secret value (Tattle matches spell names instead). Life Grip and Rescue put an aura on the player they " ..
+        "moved, so those are attributed from that mark. A Swapblaster marks nobody, so its other half is read from " ..
+        "the caster's target - named when your client can see it, left out when it cannot. Run " ..
         "/tattle probe to confirm what your client actually exposes before you trust a spell ID or an \"Only me\" filter."
     )
     -- Measured rather than guessed: a paragraph's height depends on the client's

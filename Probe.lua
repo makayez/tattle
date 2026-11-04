@@ -130,11 +130,14 @@ function Tattle.ToggleProbe()
         print(string_format("|cffff6600[Tattle Probe]|r   neural silencers    -> %s",
             wearers[1] and table_concat(wearers, ", ") or "none"))
 
-        -- Fourth: does this client expose other players' targets? "<member>target"
-        -- is all the watch list has to work with, and a build that never syncs it
-        -- shows nothing but "none / not synced" no matter who is looking at you.
-        -- Reading your own target off another player is not possible, so a blank
-        -- here is not evidence that nobody is aiming at you.
+        -- Fourth: does this client expose other players' targets? Two features are
+        -- built on this one token: the watch list's "targeting you" section, and the
+        -- Swapblaster module naming the other half of a swap (the toy marks nobody,
+        -- so its victim is read from the caster's target). A build that never syncs
+        -- it prints "none / not synced" no matter who is looking at you, and both
+        -- features then say nothing rather than guessing -- which is the correct
+        -- answer, not a broken one. Reading your own target off another player is not
+        -- possible, so a blank here is not evidence that nobody is aiming at you.
         local entries = Tattle.GroupTargetEntries()
         local shown, watchers = 0, {}
         for _, entry in ipairs(entries) do

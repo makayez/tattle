@@ -126,7 +126,9 @@ If `/tattle debug` prints `WARNING: spell ID ... not found`, or the probe shows 
    - [ ] Set chat type to `Raid` while in a 5-man party and verify `/tattle status` reports it will be sent on `PARTY`
 
 9. **Target Detection limits**
-   - [ ] Confirm Swapblaster reports no victim - expected, the spell marks nobody
+   - [ ] Have a friend **target you** and fire a Swapblaster: expect `Donut is casting Swapblaster at you`, then `Donut used Swapblaster on you`
+   - [ ] Repeat with that friend targeting somebody else, then with nothing targeted: the alert should name the other player, then name nobody
+   - [ ] If nobody is ever named, read the probe's target lines - some clients are not told other players' targets, and the alert is then correct to stay quiet about the victim
    - [ ] If Life Grip or Rescue reports `(target unknown)`, check the probe's aura line for your client
 
 ### Alert Testing
@@ -190,7 +192,7 @@ Debug output shows:
 
 ## Known Limitations
 
-1. **No victim for Swapblaster**: the swap applies no aura to either participant, and 12.0.0 removed `COMBAT_LOG_EVENT_UNFILTERED`, which was the only API that carried a destination. Swapblaster alerts name the caster only
+1. **Swapblaster's other half is a target read, not a signature**: the swap applies no aura to either participant, and 12.0.0 removed `COMBAT_LOG_EVENT_UNFILTERED`, which was the only API that carried a destination. The module reads `<caster>target` at the moment the cast starts, so the victim is named on a client that syncs group targets and left unmentioned - never guessed - on one that does not
 2. **Aura-dependent attribution**: Life Grip and Rescue can only be attributed while group auras are readable. 12.1.0 relaxed this out of combat; inside instances it can still be refused
 3. **Group Only**: alerts only work when in a party or raid group, which is also the only way these abilities can be used
 4. **In-combat use is ignored** for Life Grip and Rescue, where pulling someone is a legitimate save

@@ -18,9 +18,10 @@ The detection module (`Modules/Swapblaster.lua`, spell `161399`):
    - Reports a channel that ended early, plus cancelled/interrupted casts
    - Tracks `UNIT_SPELLCAST_CHANNEL_START` / `_CHANNEL_STOP` as well as `_START` / `_SUCCEEDED`, because the cast is flagged channeled
 
-2. **No victim name (a 12.x limit, not a missing feature)**
-   - The swap applies no aura to either participant, and 12.0.0 removed the combat log, which was the only API that reported a destination
-   - So Swapblaster alerts name the caster only. Life Grip and Rescue *can* name their victim, because those do apply an aura
+2. **Two ways to find the other half of a cast, and neither is the combat log**
+   - Life Grip and Rescue put a short aura on the player they moved, so their victim is named from that signature - proof rather than inference
+   - The Swapblaster marks nobody, so its victim is whoever the caster had targeted when the cast started, read from `<caster>target`. The toy needs a target, and 12.0.0 removed the only API that used to report a destination
+   - That is a read, so the wording is `at Pancakes` while the cast runs and `on Pancakes` once it lands. A client that is not told other players' targets gets the old sentence with nobody named - never a guess. The Monitor scope is deliberately not narrowed by this read: muting a swap because a target field pointed elsewhere would trade a rare extra alert for a missed grief
 
 3. **Neural Silencer Detection**
    - Checks the group for the "Neural Silencer" aura (`156779` from the item, `384129` for the craftable Mk3)
@@ -277,7 +278,7 @@ tattle/
 Tattle is a production-ready, highly customizable addon for monitoring group member actions. The three modules show what the 12.x API still allows:
 
 - Detection through unit cast events (the combat log is gone in 12.0.0)
-- Victim naming where the spell leaves an aura (Life Grip, Rescue); Swapblaster leaves none, so it is reported without a victim
+- Victim naming from an aura where the spell leaves one (Life Grip, Rescue), and from the caster's target where it does not (Swapblaster)
 - Neural Silencer awareness
 - Multiple alert methods
 - Fully customizable screen alerts

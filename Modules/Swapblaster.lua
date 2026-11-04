@@ -52,6 +52,27 @@ local isSwap, isBackfire
 -- Cast state keyed on unitToken (a plain string, always safe).
 local activeCasts = {}
 
+-- How long a settled record keeps suppressing its cast's other terminal events.
+-- The events for one cast arrive within a second or two of each other; anything
+-- later than this from the same unit belongs to a different cast, and must not be
+-- silenced by the tombstone the first one left behind.
+local RESOLVED_TTL = 8
+
+-- A record whose cast is over and whose TTL has run out. Without this the record
+-- is a permanent mute: a caster who fires twice, in a pattern where the second
+-- cast's start never reaches us (out of range, a /reload mid-channel, a client
+-- that reports only the completion), would be announced once ever.
+local function IsStale(cast)
+    return cast.resolved and cast.resolvedAt ~= nil
+        and (GetTime() - cast.resolvedAt) > RESOLVED_TTL
+end
+
+-- Settles a record so the other half of the same cast cannot announce it twice.
+local function Resolve(cast)
+    cast.resolved = true
+    cast.resolvedAt = GetTime()
+end
+
 -- ============================================================================
 -- Helpers
 -- ============================================================================
@@ -76,6 +97,20 @@ end
 -- A channeled cast that stopped early was cut short, not completed. Without a
 -- known window we cannot tell, and the caller says so plainly instead of
 -- guessing.
+-- " on Pancakes" / " at you" / "". The empty string is the honest answer on a
+-- client that was not told other players' targets: the sentence then reads exactly
+-- as it did before the victim was knowable at all. Two forms because a cast start
+-- describes where the toy was pointed and a completion says the swap happened;
+-- both name the same group member, read once when the cast was armed.
+local function VictimPhrase(cast, preposition)
+    local who = cast and Tattle.UnitDisplayName(cast.victim)
+    if not who then return "" end
+    return " " .. preposition .. " " .. who
+end
+
+local function AimPhrase(cast)     return VictimPhrase(cast, "at") end
+local function OnPhrase(cast)      return VictimPhrase(cast, "on") end
+
 local function FinishedAsExpected(cast)
     if not cast.duration then return nil end
     return (GetTime() - cast.startedAt) >= (cast.duration - 0.35)
@@ -98,6 +133,11 @@ local function ArmCast(unitToken, channelled)
         -- group as it was when the swap was fired, and one sweep per cast is
         -- cheaper than one per message.
         wearers   = Tattle.SilencerWearerNames(),
+        -- Also now, and for a different reason: the toy swaps you with whoever you
+        -- have targeted, so at this instant the caster's target *is* the other
+        -- half of the swap. Read once here rather than at every message, because a
+        -- caster who retargets two seconds later is not griefing somebody else.
+        victim    = Tattle.GroupMemberTargetOf(unitToken),
         startedAt = GetTime(),
         duration  = CastWindowSeconds(unitToken, channelled),
         resolved  = false,
@@ -110,13 +150,25 @@ end
 -- only ever see the completion of is not dropped.
 local function ClaimCast(unitToken)
     local cast = activeCasts[unitToken]
-    if cast then
+    if cast and not IsStale(cast) then
         if cast.resolved then return nil end
-        cast.resolved = true
+        Resolve(cast)
         return cast
     end
 
-    activeCasts[unitToken] = { wearers = {}, startedAt = GetTime(), duration = nil, resolved = true }
+    -- A cast with no record gets one now, and the target is read here too: it is
+    -- weaker evidence than the read taken when the cast started (the caster may
+    -- have moved on), but "we never heard the start" is not a reason to name
+    -- nobody. The wearer list stays empty -- a sweep at this point would describe
+    -- a group that had already reacted to the swap.
+    activeCasts[unitToken] = {
+        wearers   = {},
+        victim    = Tattle.GroupMemberTargetOf(unitToken),
+        startedAt = GetTime(),
+        duration  = nil,
+        resolved  = true,
+        resolvedAt = GetTime(),
+    }
     return activeCasts[unitToken]
 end
 
@@ -135,15 +187,18 @@ end
 -- Never reached for a cast that *began* in combat: the core's "start" policy
 -- dropped that start, so the only completion that gets here belongs to a swap
 -- that started out of combat.
-local function CompletionMessage(sourceName, unitToken)
+local function CompletionMessage(sourceName, unitToken, cast)
+    local on = OnPhrase(cast)
     if not Tattle.UnitInCombat(unitToken) then
         local clause = Tattle.SilencerCheatClause(unitToken, sourceName)
         if clause then
-            return string_format("%s used Swapblaster%s", sourceName, clause)
+            -- The clause already names the protected wearer, so the generic "worn
+            -- by" note stays off this sentence.
+            return string_format("%s used Swapblaster%s%s", sourceName, on, clause)
         end
     end
-    return string_format("%s used Swapblaster%s",
-        sourceName, SilencerNote(Tattle.SilencerWearerNames()))
+    return string_format("%s used Swapblaster%s%s",
+        sourceName, on, SilencerNote(Tattle.SilencerWearerNames()))
 end
 
 -- "Swapblaster Explosion" is what the caster eats when the player they tried to
@@ -155,23 +210,36 @@ end
 local function HandleBackfire(unitToken, sourceName)
     if not sourceName then return end
 
-    -- Whichever half of the cast we hear about last must not announce it twice.
+    -- Whichever half of the cast we hear about last must not announce it twice --
+    -- unless the record is a stale one, in which case this backfire belongs to a
+    -- later cast and deserves its own alert.
     local cast = activeCasts[unitToken]
-    if cast then
+    if cast and not IsStale(cast) then
         if cast.resolved then return end
-        cast.resolved = true
+        Resolve(cast)
     end
 
-    local message = Tattle.BlockedBySilencer(sourceName, "Swapblaster", nil, unitToken)
-        or string_format("%s's Swapblaster backfired", sourceName)
+    -- The read is fresh rather than the one stored on the cast record: the backfire
+    -- is its own spell and can be the first thing we hear about. Passing it as the
+    -- victim list is safe rather than presumptuous -- BlockedBySilencer only names a
+    -- victim it can confirm is protected, and falls back to the group's wearer list
+    -- when the read is empty or lands on somebody without the buff.
+    local victim = Tattle.GroupMemberTargetOf(unitToken)
+    local message = Tattle.BlockedBySilencer(sourceName, "Swapblaster",
+        victim and { victim } or nil, unitToken)
+        or string_format("%s's Swapblaster%s backfired", sourceName, OnPhrase({ victim = victim }))
     Tattle.SendAlert(message, MODULE_ID)
     Tattle.DebugPrint("Swapblaster backfire:", sourceName)
 end
 
--- Swap applies no aura to either side, so nothing about this spell can say who
--- got swapped with whom: the destination lived only in the combat log. These
--- alerts name the caster and leave the victim to your own eyes -- except when the
--- target was protected, which the backfire announces.
+-- Swap applies no aura to either side, so the swap itself cannot be attributed the
+-- way Life Grip and Rescue can: the destination lived only in the combat log, and
+-- 12.0.0 removed it. What is left is the caster's own target, which the toy
+-- requires ("Swaps your location with another party member") and which the client
+-- exposes as `<caster>target` when it exposes it at all. So the alerts name the
+-- victim when your client was told who the caster had targeted, and say nothing
+-- about the victim when it was not -- they never guess, and never claim the swap
+-- landed on somebody the caster was not looking at.
 local function OnEvent(event, unitToken, castGUID, spellID, spellName)
     -- A guard, not the primary filter: the dispatcher has already dropped casts
     -- by anyone who is not one of your group's players. It stays because that
@@ -192,9 +260,12 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         return
     end
 
-    -- Scope "self" only drops casts we can prove missed you, which for this spell
-    -- is never -- the swap marks nobody -- so a Swapblaster aimed at a friend is
-    -- still reported.
+    -- Scope "self" only drops casts we can prove missed you. The target read is
+    -- deliberately NOT fed to that decision: it is strong evidence of intent and
+    -- good enough to put a name in a sentence, but suppressing an alert on it would
+    -- mean a swap you never saw coming goes unreported because the caster's target
+    -- field was momentarily somewhere else. So a Swapblaster aimed at a friend is
+    -- still reported to someone watching only for themselves.
     if Tattle.ScopeDrops(MODULE_ID, unitToken) then return end
 
     if event == "UNIT_SPELLCAST_START" or event == "UNIT_SPELLCAST_CHANNEL_START" then
@@ -202,24 +273,26 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         if not cast then return end
 
         local note = SilencerNote(cast.wearers)
-        Tattle.SendAlert(string_format("%s is casting Swapblaster%s", sourceName, note), MODULE_ID)
+        Tattle.SendAlert(string_format("%s is casting Swapblaster%s%s",
+            sourceName, AimPhrase(cast), note), MODULE_ID)
         Tattle.DebugPrint("Swapblaster START:", sourceName, note)
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
-        if not ClaimCast(unitToken) then return end
+        local claimed = ClaimCast(unitToken)
+        if not claimed then return end
 
-        Tattle.SendAlert(CompletionMessage(sourceName, unitToken), MODULE_ID)
+        Tattle.SendAlert(CompletionMessage(sourceName, unitToken, claimed), MODULE_ID)
         Tattle.DebugPrint("Swapblaster SUCCESS:", sourceName)
 
     elseif event == "UNIT_SPELLCAST_CHANNEL_STOP" then
         local cast = activeCasts[unitToken]
-        if not cast or cast.resolved then return end
-        cast.resolved = true
+        if not cast or (cast.resolved and not IsStale(cast)) then return end
+        Resolve(cast)
 
         local finished = FinishedAsExpected(cast)
 
         if finished == true then
-            Tattle.SendAlert(CompletionMessage(sourceName, unitToken), MODULE_ID)
+            Tattle.SendAlert(CompletionMessage(sourceName, unitToken, cast), MODULE_ID)
         else
             -- "cut short" when the channel clearly stopped early, and a plainer
             -- "cast ended" when there was no window to measure against. The wearers
@@ -227,26 +300,29 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
             -- alerts for this cast - no second sweep for a message in the same
             -- breath as the cast.
             local note = SilencerNote(cast.wearers)
-            Tattle.SendAlert(string_format("%s's Swapblaster %s%s",
-                sourceName, finished == false and "was cut short" or "cast ended", note), MODULE_ID)
+            Tattle.SendAlert(string_format("%s's Swapblaster%s %s%s",
+                sourceName, OnPhrase(cast),
+                finished == false and "was cut short" or "cast ended", note), MODULE_ID)
         end
         Tattle.DebugPrint("Swapblaster CHANNEL_STOP:", sourceName, finished)
 
     elseif event == "UNIT_SPELLCAST_FAILED" then
         local cast = activeCasts[unitToken]
-        if not cast or cast.resolved then return end
-        cast.resolved = true
+        if not cast or (cast.resolved and not IsStale(cast)) then return end
+        Resolve(cast)
 
         local note = SilencerNote(cast.wearers)
-        Tattle.SendAlert(string_format("%s's Swapblaster failed%s", sourceName, note), MODULE_ID)
+        Tattle.SendAlert(string_format("%s's Swapblaster%s failed%s",
+            sourceName, OnPhrase(cast), note), MODULE_ID)
         Tattle.DebugPrint("Swapblaster FAILED:", sourceName, note)
 
     elseif event == "UNIT_SPELLCAST_INTERRUPTED" then
         local cast = activeCasts[unitToken]
-        if not cast or cast.resolved then return end
-        cast.resolved = true
+        if not cast or (cast.resolved and not IsStale(cast)) then return end
+        Resolve(cast)
 
-        Tattle.SendAlert(string_format("%s's Swapblaster was interrupted", sourceName), MODULE_ID)
+        Tattle.SendAlert(string_format("%s's Swapblaster%s was interrupted",
+            sourceName, OnPhrase(cast)), MODULE_ID)
         Tattle.DebugPrint("Swapblaster INTERRUPTED:", sourceName)
     end
 end

@@ -284,8 +284,12 @@ Tattle.IsGrouped = IsGrouped
 -- Returns short name (no realm) for a unit token.
 local function GetUnitShortName(unitToken)
     if not unitToken then return nil end
-    local fullName = UnitName(unitToken)
-    if not fullName then return nil end
+    -- pcall'd because the tokens handed to this are not always plain group
+    -- indexes: the swap victim lookup asks about a unit that only exists if the
+    -- client synced it, and a restricted context refuses the read rather than
+    -- returning nil.
+    local ok, fullName = pcall(UnitName, unitToken)
+    if not ok or not fullName then return nil end
     return fullName:match("^([^-]+)") or fullName
 end
 Tattle.GetUnitShortName = GetUnitShortName
@@ -433,6 +437,39 @@ local function GroupTargetEntries()
 end
 Tattle.GroupTargetEntries = GroupTargetEntries
 
+-- Which group member a unit currently has targeted, as a group token, or nil when
+-- the target is unreadable or is not one of ours.
+--
+-- This is the only remaining way to find out who a spell was aimed at: the combat
+-- log was the one API that carried a destination, and 12.0.0 removed it. It is a
+-- read of `raidNtarget`, which is group data of the same family the raid frames
+-- use - so it is there or it is not, per patch and per context, and "nil" means
+-- "your client was not told", never "nobody was targeted".
+--
+-- The existence check runs first on purpose. Resolving a target means a
+-- UnitIsUnit per group member, which is twenty-odd calls in a raid; on a client
+-- that was never told the target, or with a caster who has none, one UnitExists
+-- answers the question and the loop never runs.
+local function GroupMemberTargetOf(unitToken)
+    if not unitToken then return nil end
+    local targetToken = unitToken .. "target"
+
+    local ok, exists = pcall(UnitExists, targetToken)
+    if not (ok and exists) then return nil end
+
+    -- You first: it is the answer that matters most and it costs one call.
+    if IsSameUnit(targetToken, "player") then return "player" end
+    for _, member in ipairs(GroupUnitTokens()) do
+        if member ~= "player" and IsSameUnit(targetToken, member) then
+            return member
+        end
+    end
+    -- A caster who has an NPC, a pet or a nameplate targeted. Nothing Tattle
+    -- watches can be swapped with that, so there is no victim to name.
+    return nil
+end
+Tattle.GroupMemberTargetOf = GroupMemberTargetOf
+
 -- Group members whose current target is you, by short name. Empty means "none
 -- that we can read", not "nobody": see GroupTargetEntries.
 local function WatcherNames(entries)
@@ -496,11 +533,21 @@ local function FormatList(t)
 end
 Tattle.FormatList = FormatList
 
+-- One group member, named the way an alert names anybody: "you" for yourself, so
+-- an alert about you reads "Donut used Swapblaster on you" rather than using the
+-- name your client reports for your own unit.
+local function UnitDisplayName(unitToken)
+    if not unitToken then return nil end
+    if IsYou(unitToken) then return "you" end
+    return GetUnitShortName(unitToken)
+end
+Tattle.UnitDisplayName = UnitDisplayName
+
 -- "you" / "Donut" / "Donut and Pancakes", for the "used X on Y" alerts.
 local function TargetPhrase(carrierTokens)
     local names = {}
     for i, token in ipairs(carrierTokens) do
-        names[i] = IsYou(token) and "you" or (GetUnitShortName(token) or "someone")
+        names[i] = UnitDisplayName(token) or "someone"
     end
     return FormatList(names) or "someone"
 end

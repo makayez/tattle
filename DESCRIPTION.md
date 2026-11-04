@@ -37,11 +37,12 @@ groups, where a plain raid chat send is silently dropped by the game.
 
 ## What it will never tell you
 
-It does not guess. Swapblaster leaves no signature on the person who was moved,
-so Tattle reports the cast with confidence and never names a victim it cannot
-prove. Life Grip and Rescue mark their destination with an aura, so those it can
-attribute exactly. A failure caused by a Neural Silencer is reported as
-"attempted", because the proof is that nothing landed, not that something did.
+It does not guess. Life Grip and Rescue mark the person they moved with an aura,
+so those are attributed exactly. Swapblaster leaves no signature at all, so its
+other half is read from the caster's target field - named when your client can see
+it, left unmentioned when it cannot, never inferred from who happened to be
+standing there. A failure caused by a Neural Silencer is reported as "attempted",
+because the proof is that nothing landed, not that something did.
 
 ## Neural Silencers
 

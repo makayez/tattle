@@ -1,5 +1,26 @@
 # Recent Updates
 
+### The swap finally says who it was aimed at
+**Before**: `Donut used Swapblaster`. Every doc said the victim cannot be named,
+because the toy marks nobody and 12.0.0 deleted the one API that reported a spell's
+destination
+
+**Now**: `Donut used Swapblaster on Pancakes` - or `on you`, which is the whole
+reason to install this. The victim is read from the caster's own target at the
+moment the cast starts, which is when the toy requires a target (*Swaps your
+location with another party member*). A client that is never told other players'
+targets gets the old sentence with nobody named, because the answer to "who was
+their target" is "your client was not told", not a guess
+
+**What that found**: the settled cast record - kept so the two halves of one cast
+cannot announce it twice - was permanent, so a caster's *next* swap, if it reached
+the module only as a completion, matched the old record and was thrown away as a
+duplicate. Records now expire after 8 seconds
+
+**Also true of this build**: the whole review pass below, the raid unit-model fix
+(the addon was scanning you twice and saying so out loud), and 107 checks became 117
+
+
 ### The review pass: one event frame, and the addon was reading you twice
 **Before**: `EventListener.lua` and `Core.lua` each created an event frame and
 both registered the same six cast events; Life Grip, Rescue and Swapblaster each

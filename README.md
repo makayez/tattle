@@ -9,7 +9,7 @@ A World of Warcraft addon (retail 12.x) that alerts when a group member uses a m
 - **Swapblaster Detector** (spell `161399` "Swap", from the Swapblaster item 111820):
   - Alerts when a group member begins the 1.5 second cast, and when it completes
   - Reports a cast that was cut short, failed, or interrupted
-  - Names the caster. The swap itself puts no aura on anyone, so **the victim cannot be named**
+  - Names the caster, and the other half of the swap when your client can see who the caster had targeted: `Donut used Swapblaster on Pancakes`. The swap leaves no aura on either player, so that name is a read of the caster's target rather than proof - and where your client has not been told, the alert names the caster and says nothing about the rest
   - Notes who in the group is wearing a **Neural Silencer** (12-hour "Immune to some annoyances" aura, spells `156779` / `384129`), which blocks the swap
 
 - **Life Grip Detector** (spell `73325` - the game names it "Leap of Faith"):
@@ -131,7 +131,8 @@ See `Modules/CastSpells.lua` for the two cast detectors - Life Grip and Rescue a
 Midnight 12.0.0 removed `COMBAT_LOG_EVENT_UNFILTERED` (registering it now raises `ADDON_ACTION_FORBIDDEN`), and that was the only API that carried a spell's **destination**. Two techniques replace it:
 
 - **Secret spell IDs**: inside restricted content the `spellID` from cast events is a secret value - it cannot be compared with `==`, printed, or used as a table key. Tattle resolves its own known IDs to spell names once at startup and compares against the name the core resolves for each event (`C_Spell.GetSpellName`, falling back to `C_Spell.GetSpellInfo`).
-- **Auras as destinations**: Life Grip and Rescue mark the player they grabbed with a short aura, so the victim is named by scanning group auras (`C_UnitAuras.GetAuraDataBySpellName`), which 12.1.0 made readable out of combat again. Swapblaster marks nobody, so its alerts stop at the caster's name.
+- **Auras as destinations**: Life Grip and Rescue mark the player they grabbed with a short aura, so the victim is named by scanning group auras (`C_UnitAuras.GetAuraDataBySpellName`), which 12.1.0 made readable out of combat again.
+- **The caster's target as the fallback**: the Swapblaster marks nobody, so its other half comes from `<caster>target`, read when the cast starts. The toy requires a target - its own tooltip says *Swaps your location with another party member* - and that token is group data of the same family raid frames read. Where the client does not sync it, the alert leaves the victim out rather than guessing.
 
 ### Performance
 
@@ -162,7 +163,7 @@ The shipped IDs were checked against the live 12.1.5 spell database, but the API
 
 1. `/tattle debug` then `/tattle probe`, then use each ability on yourself and on a friend
 2. The probe prints every cast event it sees (including the channeled `CHANNEL_START` / `CHANNEL_STOP` the Swapblaster uses), whether the caster argument can be named, whether any destination argument is exposed, and which group auras are visible - which is what the "on Donut" half of an alert depends on
-3. It also prints the group's Neural Silencer wearers and what it can read from other players' target tokens, which is all the optional watch list has to work with
+3. It also prints the group's Neural Silencer wearers and what it can read from other players' target tokens - which is all the optional watch list has to work with, and also where the Swapblaster's victim name comes from
 4. If an ID is wrong for your build, enter the right one in the module tab's spell ID editor and `/reload`
 
 ## The Tattle Turtle (icon and artwork)
@@ -204,7 +205,7 @@ To ship a version:
 
 1. Bump `## Version` in `Tattle.toc`, and turn the `## [Unreleased]` heading in `CHANGELOG.md` into `## [<version>] - <date>`
 2. Run the harness: `lua Tests/wow_stub.lua`
-3. Tag and push: `git tag -a v0.2.0-alpha.2 -m "Tattle 0.2.0-alpha.2"` then `git push origin main v0.2.0-alpha.2`
+3. Tag and push: `git tag -a v0.2.0-alpha.3 -m "Tattle 0.2.0-alpha.3"` then `git push origin main v0.2.0-alpha.3`
 
 The tag must be **annotated** (`git tag -a`), because the packager reads the version from the tag and builds the changelog from the commits between tags.
 

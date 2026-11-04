@@ -2,13 +2,19 @@
 
 All notable changes to Tattle will be documented in this file.
 
-## [Unreleased]
+## [0.2.0-alpha.3] - 2026-11-04
 
-A review pass over the whole addon: what the code claims, what it costs, and what
-is left in it that nothing calls. One user-visible bug, which the harness could
-not see until the harness was made to model a raid correctly.
+A review pass over the whole addon - what the code claims, what it costs, and what
+was still in it that nothing calls - plus the one feature it kept describing as a
+limitation and never tried to work around. And one user-visible bug that the
+harness could not see until the harness was made to model a raid correctly.
+
+### Added
+- **Swapblaster now names the other half of the swap.** The toy leaves no aura on either player, and `COMBAT_LOG_EVENT_UNFILTERED` - the only API that ever reported where a spell was aimed - was removed in 12.0.0. So the victim is read from the caster's own target at the moment the cast starts, which is the instant the toy requires a target ("Swaps your location with another party member"): `Donut is casting Swapblaster at Pancakes`, then `Donut used Swapblaster on Pancakes` - or `at you` / `on you`, which is the sentence this addon exists to produce. Where your client is not told other players' targets the alert says what it always said and names nobody: `Tattle.GroupMemberTargetOf` answers "your client was not told" with nothing, and the module will not guess. A backfire whose target is readable names the protected player who set it off instead of hedging about "a protected group member"
+- That read is deliberately **not** fed to the `Only me` scope. It is strong evidence of intent and good enough to put a name in a sentence, but suppressing an alert on it would mean a swap you never saw coming went unreported because a target field was momentarily pointing elsewhere
 
 ### Fixed
+- **Swapblaster's other half, part two: a caster's second swap could be silenced by their first.** One cast's record is kept after it settles so the two halves of the same cast (START with CHANNEL_START, SUCCEEDED with CHANNEL_STOP) cannot announce it twice - but the record was permanent, so a *later* cast by the same unit that reached the module only as a completion (out of range, a `/reload` mid-channel, a client that reports the toy only once it resolves) matched the old settled record and was discarded as a duplicate. Settled records now expire after 8 seconds: far longer than one cast's own events take to arrive, far shorter than any gap between two casts a player can make
 - **The addon read you twice in a raid.** In a raid you hold one of the `raidN` indexes and `GetNumGroupMembers()` counts you; a party calls you `player` and numbers only the other four. `GroupUnitTokens` enumerated `raidN` up to the member count *and* appended `player`, so inside a raid you were scanned twice, and every group-wide sentence gained a second copy of you: the watch list said `you and you`, a blocked cast said `because you and you are using a Neural Silencer`, a Life Grip that landed on you read `used Life Grip on you and you`, and an Evoker who Rescued Pancakes was reported as also having been rescued by themselves. Unit tokens that might name you are now compared with `UnitIsUnit` (`Tattle.IsYou`, `Tattle.IsSameUnit`) rather than with `==`, which is also the safe way to compare a token that could be a secret value
 - **A module registered after `ADDON_LOADED` was left half wired**: no settings, and its declared events were never installed as listeners, because the core registers events once at start-up and had no second chance. `RegisterModule` now initialises its settings and rebuilds the listener table, so a late module works or is loudly broken rather than quietly doing nothing
 - **The config panel's height was a constant** (`700`) picked when the addon had fewer options in it, and tabs are not clipped - the next option added to the tallest tab would have spilled its spell ID editor over the bottom of the window. Each tab builder now reports the depth it used and the window is built around the deepest one
@@ -31,7 +37,9 @@ not see until the harness was made to model a raid correctly.
 - Every addon file now opens with `local _, Tattle = ...` and receives the namespace table the core created, so the only globals the addon leaves in the client are `TattleDB` and the slash command entry
 
 ### Notes
-- **The stub now models a raid the way the client numbers one**: you hold a raid index, `GetNumGroupMembers()` counts you, and an aura on you is readable through either of your tokens. That is what made the double-count fix testable - with the self-exclusion removed from `GroupUnitTokens`, five checks fail, one of which reads `it failed because you and you are using a Neural Silencer`. Checks went from 97 to 106, adding coverage for the unit-token list, the watcher sweep's own entry, protected-person naming, Rescue's self-mark, late module registration, and the `allCasters` opt-out (which had none)
+- **The stub now models a raid the way the client numbers one**: you hold a raid index, `GetNumGroupMembers()` counts you, and an aura on you is readable through either of your tokens. That is what made the double-count fix testable - with the self-exclusion removed from `GroupUnitTokens`, five checks fail, one of which reads `it failed because you and you are using a Neural Silencer`
+- **The stub's `UnitIsUnit` now resolves `<unit>target` tokens** to whoever they point at, and treats your raid index and `player` as the same person on either side of the question. Comparing them as strings, which it did, let it agree that `raid1target` was "not raid3" and "was player" in the same breath - the same mistake the addon was making
+- **Checks went from 97 to 117.** New coverage: the unit-token list and the watcher sweep's own entry, protected-person naming, Rescue's self-mark, late module registration, the `allCasters` opt-out (which had none), Swapblaster victim naming in both directions (a readable target names the player, an unreadable or non-player target names nobody), `at you` / `on you`, a backfire that names the immune player behind it, that a target lookup spends one `UnitExists` before it is allowed to spend any `UnitIsUnit`, that a target who is you resolves to `player` rather than to your raid index, and that a second swap from one caster is not muted by the first one's record while the two halves of a single cast are still announced once
 - **The harness now fails when a widget setter is handed `nil`** where the client demands a number. It previously shrugged at `panel:SetSize(700, nil)` - an error on a real client - because its setters type-checked and dropped what they did not understand
 - `README.md` gained the file layout and what each file is for; `PROJECT_SUMMARY.md`, `FEATURES.md` and the config panel's own About text no longer describe the pre-review addon
 

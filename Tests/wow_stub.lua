@@ -320,9 +320,17 @@ LE_GROUP_TYPE_RAID = "raid"
 -- that is not told other players' targets.
 local targets = {}
 
-UnitExists = function(unit)
+-- Counted, so a check can prove that "your client was not told" is answered by one
+-- cheap question rather than a UnitIsUnit per raid member.
+unitExistsCalls, unitIsUnitCalls = 0, 0
+
+local function unitExists(unit)
     if string.match(unit, "target$") then return targets[unit] ~= nil end
     return nameFor(unit) ~= nil
+end
+UnitExists = function(unit)
+    unitExistsCalls = unitExistsCalls + 1
+    return unitExists(unit)
 end
 UnitName = function(unit)
     local owner = string.match(unit, "^(.-)target$")
@@ -332,11 +340,26 @@ UnitName = function(unit)
     end
     return nameFor(unit)
 end
+local function unitIsUnit(a, b)
+    -- `<unit>target` tokens answer as whoever they point at, and a target the
+    -- client was never told about is not the same unit as anything. Comparing the
+    -- raw strings, as this did, says "raid1target is not raid3" while also saying
+    -- "raid1target is player" -- the same person under two tokens, which is exactly
+    -- the mistake the addon is supposed to stop making.
+    local function resolve(u)
+        if type(u) ~= "string" then return nil end
+        if string.match(u, "target$") then return targets[u] end
+        return u
+    end
+    local ra, rb = resolve(a), resolve(b)
+    if not ra or not rb then return false end
+    if isMe(ra) then return isMe(rb) and true or false end
+    if isMe(rb) then return isMe(ra) and true or false end
+    return ra == rb
+end
 UnitIsUnit = function(a, b)
-    if string.match(a, "target$") then return targets[a] == b end
-    if isMe(a) then return isMe(b) end
-    if isMe(b) then return isMe(a) end
-    return a == b
+    unitIsUnitCalls = unitIsUnitCalls + 1
+    return unitIsUnit(a, b)
 end
 -- Both membership queries answer for you as well as for the numbered members, the
 -- way they do on a real client: UnitInRaid("player") is true in a raid, and
@@ -574,6 +597,12 @@ local function resetWorld()
     for token in pairs(targets) do targets[token] = nil end
 end
 
+-- Who a group member currently has targeted. No helper for "the client was not
+-- told": that is what `resetWorld` leaves the table at.
+local function setTarget(owner, target)
+    targets[owner .. "target"] = target
+end
+
 -- A group member with a Neural Silencer up, by short name. "Me" is you, and you
 -- are addressed as "player" here even though you also hold a raidN index -- the
 -- core is what has to reconcile those two, so the helper uses the plain token.
@@ -804,6 +833,150 @@ check("a channel cut short is not reported as a completed swap",
         and messageContaining("Pancakes's Swapblaster was cut short") ~= nil
         and messageContaining("Pancakes used Swapblaster") == nil,
     sentMessages[1] and sentMessages[1].message)
+
+-- ============================================================================
+-- Naming the other half of a swap
+-- ============================================================================
+
+-- The swap wears no aura, so unlike a grip there is no destination marker to read.
+-- What is left is the caster's own target, which the toy requires ("Swaps your
+-- location with another party member") and which the client exposes as
+-- `<caster>target` when it exposes it at all. Both halves matter: the name when the
+-- read works, and the old victim-free sentence, not a guess, when it does not.
+
+resetWorld()
+alertMode("swapblaster", "YELL")
+
+setTarget("raid1", "raid2")
+table.wipe(sentMessages)
+setClock(4000)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-victim-1", 161399)
+setClock(4002)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-victim-1", 161399)
+runTimers()
+local victimPair = (sentMessages[1] and sentMessages[1].message or "(none)")
+    .. " / " .. (sentMessages[2] and sentMessages[2].message or "(none)")
+check("a swap names the group member the caster had targeted",
+    messageContaining("Donut is casting Swapblaster at Pancakes") ~= nil
+    and messageContaining("Donut used Swapblaster on Pancakes") ~= nil,
+    victimPair)
+
+setTarget("raid1", "player")
+table.wipe(sentMessages)
+setClock(4100)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-victim-2", 161399)
+setClock(4102)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-victim-2", 161399)
+runTimers()
+check("being the other half of a swap reads as \"at you\" and \"on you\"",
+    messageContaining("Donut is casting Swapblaster at you") ~= nil
+    and messageContaining("Donut used Swapblaster on you") ~= nil,
+    (sentMessages[1] and sentMessages[1].message or "(none)")
+    .. " / " .. (sentMessages[2] and sentMessages[2].message or "(none)"))
+
+-- No target synced at all: the victim stays out of the sentence rather than being
+-- guessed or announced as unknown.
+resetWorld()
+alertMode("swapblaster", "YELL")
+table.wipe(sentMessages)
+setClock(4200)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-victim-3", 161399)
+setClock(4202)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-victim-3", 161399)
+runTimers()
+local unreadable = (sentMessages[1] and sentMessages[1].message or "")
+    .. " / " .. (sentMessages[2] and sentMessages[2].message or "")
+check("an unreadable target names nobody rather than guessing",
+    messageContaining("Donut is casting Swapblaster") ~= nil
+    and messageContaining("Donut used Swapblaster") ~= nil
+    and unreadable:find(" at ") == nil and unreadable:find(" on ") == nil,
+    unreadable)
+
+-- A caster looking at something that is not a player: the swap cannot have used
+-- it, so there is no victim to name.
+setTarget("raid1", "npc1")
+table.wipe(sentMessages)
+setClock(4300)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-victim-4", 161399)
+setClock(4302)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-victim-4", 161399)
+runTimers()
+local notPlayer = (sentMessages[1] and sentMessages[1].message or "")
+    .. " / " .. (sentMessages[2] and sentMessages[2].message or "")
+check("a caster with an NPC targeted names nobody",
+    notPlayer:find(" at ") == nil and notPlayer:find(" on ") == nil, notPlayer)
+
+-- Cost, since this runs on every swap in a 25-man raid: the target lookup answers
+-- "your client was not told" with one UnitExists, and spends no UnitIsUnit at all.
+-- Back to a group with no synced targets first (the checks above left one set), and
+-- with the token cache warm so the counters hold only this lookup's own calls.
+resetWorld()
+Tattle.GroupUnitTokens()   -- warm the cache, so the count is the lookup's own
+local existsBefore, isUnitBefore = unitExistsCalls, unitIsUnitCalls
+check("reading an unreadable target costs one UnitExists and no UnitIsUnit",
+    Tattle.GroupMemberTargetOf("raid1") == nil
+    and unitExistsCalls - existsBefore == 1
+    and unitIsUnitCalls - isUnitBefore == 0,
+    "UnitExists +" .. (unitExistsCalls - existsBefore)
+    .. ", UnitIsUnit +" .. (unitIsUnitCalls - isUnitBefore))
+
+setTarget("raid1", "raid2")
+existsBefore, isUnitBefore = unitExistsCalls, unitIsUnitCalls
+check("a readable target is resolved by identity, not by string",
+    Tattle.GroupMemberTargetOf("raid1") == "raid2"
+    and unitExistsCalls - existsBefore == 1
+    and unitIsUnitCalls - isUnitBefore >= 1,
+    "resolved " .. tostring(Tattle.GroupMemberTargetOf("raid1")))
+
+-- The read also has to survive the two-token problem: set the target where only
+-- your raid index would match, and the answer must still be "player".
+setTarget("raid1", "raid" .. group.selfIndex)
+check("a target that is you resolves to \"player\", not to your raid index",
+    Tattle.GroupMemberTargetOf("raid1") == "player",
+    tostring(Tattle.GroupMemberTargetOf("raid1")))
+
+-- Two swaps from the same caster, the second one reaching us only as a completion
+-- (the classic shapes: out of range, a /reload mid-channel, a client that reports
+-- the toy only when it resolves). Deduplicating the two halves of *one* cast must
+-- not turn into muting every later cast by that unit.
+resetWorld()
+alertMode("swapblaster", "YELL")
+table.wipe(sentMessages)
+setClock(4500)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid1", "guid-swap-a", 161399)
+runTimers()
+setClock(4600)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid1", "guid-swap-b", 161399)
+runTimers()
+check("a second swap from the same caster is not muted by the first one's record",
+    #sentMessages == 2, "got " .. #sentMessages)
+
+-- ...and the dedupe that record exists for still holds inside one cast.
+resetWorld()
+table.wipe(sentMessages)
+setClock(4700)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid1", "guid-swap-c", 161399)
+setClock(4701)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-swap-c", 161399)
+runTimers()
+check("the two halves of one cast are still announced once",
+    #sentMessages == 1, "got " .. #sentMessages)
+
+-- A backfire with several protected members is usually a guessing game. With the
+-- caster's target readable, the guess is unnecessary: the buffed player they were
+-- looking at is the one whose protection set the blast off.
+resetWorld()
+alertMode("swapblaster", "YELL")
+silenceWho("Donut")
+setAura("player", "Neural Silencer", 156779)   -- a second candidate
+setTarget("raid2", "raid1")
+table.wipe(sentMessages)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-backfire-read", 182081)
+runTimers()
+check("a backfire whose target is readable names that victim instead of hedging",
+    messageContaining("Pancakes attempted a Swapblaster on Donut, but it failed because Donut is using a Neural Silencer") ~= nil,
+    sentMessages[1] and sentMessages[1].message)
+resetWorld()
 
 -- An instant cast: Life Grip sends no START, so SUCCEEDED must stand alone.
 alertMode("lifegrip", "PARTY")
