@@ -538,14 +538,23 @@ local function SilencerWearerNames(excludeToken)
 end
 Tattle.SilencerWearerNames = SilencerWearerNames
 
--- " (Neural Silencer worn by Donut)" -- "" when the group has none. A statement
--- of fact rather than an accusation, which is what a failed cast deserves: the
--- spell could have failed for any number of reasons, but it is still worth
--- knowing somebody in here is immune to it.
-local function SilencerNote(excludeToken)
-    local wearers = SilencerWearerNames(excludeToken)
-    if #wearers == 0 then return "" end
+-- " (Neural Silencer worn by Donut)" -- "" when the list is empty. A statement of
+-- fact rather than an accusation, which is what a failed cast deserves: the spell
+-- could have failed for any number of reasons, but it is still worth knowing
+-- somebody in here is immune to it.
+--
+-- This is the only place that sentence is written. Modules that already swept the
+-- group (the Swapblaster records its wearers when a cast starts, so a late alert
+-- describes the group as it was then) pass the list; everyone else passes a token
+-- to exclude and lets the sweep happen here.
+local function SilencerNoteList(wearers)
+    if not wearers or #wearers == 0 then return "" end
     return string_format(" (Neural Silencer worn by %s)", FormatList(wearers))
+end
+Tattle.SilencerNoteList = SilencerNoteList
+
+local function SilencerNote(excludeToken)
+    return SilencerNoteList(SilencerWearerNames(excludeToken))
 end
 Tattle.SilencerNote = SilencerNote
 

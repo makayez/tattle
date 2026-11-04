@@ -5,6 +5,7 @@
 local _, Tattle = ...
 
 local string_format = string.format
+local pcall = pcall   -- every cast-window read goes through it
 local ipairs = ipairs
 local type = type
 local GetTime = GetTime
@@ -55,10 +56,8 @@ local activeCasts = {}
 -- Helpers
 -- ============================================================================
 
-local function SilencerNote(wearers)
-    if #wearers == 0 then return "" end
-    return string_format(" (Neural Silencer worn by %s)", Tattle.FormatList(wearers))
-end
+-- The core owns the sentence; this module only ever has the list in hand already.
+local SilencerNote = Tattle.SilencerNoteList
 
 -- Swap is channeled, so its cast window comes from UnitChannelInfo; a plain cast
 -- window comes from UnitCastingInfo. Both return
@@ -95,6 +94,9 @@ local function ArmCast(unitToken, channelled)
     if existing and not existing.resolved then return nil end
 
     activeCasts[unitToken] = {
+        -- Recorded now, on purpose: every alert this cast produces describes the
+        -- group as it was when the swap was fired, and one sweep per cast is
+        -- cheaper than one per message.
         wearers   = Tattle.SilencerWearerNames(),
         startedAt = GetTime(),
         duration  = CastWindowSeconds(unitToken, channelled),
@@ -220,8 +222,11 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
             Tattle.SendAlert(CompletionMessage(sourceName, unitToken), MODULE_ID)
         else
             -- "cut short" when the channel clearly stopped early, and a plainer
-            -- "cast ended" when there was no window to measure against.
-            local note = SilencerNote(Tattle.SilencerWearerNames())
+            -- "cast ended" when there was no window to measure against. The wearers
+            -- are the ones recorded when the channel started, same as the other
+            -- alerts for this cast - no second sweep for a message in the same
+            -- breath as the cast.
+            local note = SilencerNote(cast.wearers)
             Tattle.SendAlert(string_format("%s's Swapblaster %s%s",
                 sourceName, finished == false and "was cut short" or "cast ended", note), MODULE_ID)
         end

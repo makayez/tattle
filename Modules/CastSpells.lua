@@ -80,9 +80,12 @@ local function MakeGripModule(spec)
 
             if passengers[1] then
                 -- Someone is wearing the aura, so the move landed and nothing
-                -- blocked it; a Neural Silencer note here would be noise.
-                Tattle.SendAlert(string_format("%s used %s on %s!",
-                    sourceName, action, Tattle.TargetPhrase(passengers)), MODULE_ID)
+                -- blocked it; a Neural Silencer note here would be noise. The
+                -- phrase gets a name because the alert and the debug line both
+                -- want it, and TargetPhrase builds a table to say three words.
+                local phrase = Tattle.TargetPhrase(passengers)
+                Tattle.SendAlert(string_format("%s used %s on %s!", sourceName, action, phrase), MODULE_ID)
+                Tattle.DebugPrint(action, "SUCCESS (out of combat):", sourceName, phrase)
             else
                 -- A grab that resolved and marked nobody has one ordinary
                 -- explanation: the passenger was wearing a Neural Silencer, so the
@@ -98,8 +101,8 @@ local function MakeGripModule(spec)
                     return
                 end
                 Tattle.SendAlert(string_format("%s used %s (target unknown)!", sourceName, action), MODULE_ID)
+                Tattle.DebugPrint(action, "SUCCESS with no passenger:", sourceName)
             end
-            Tattle.DebugPrint(action, "SUCCESS (out of combat):", sourceName, Tattle.TargetPhrase(passengers))
 
         elseif event == "UNIT_SPELLCAST_FAILED" then
             if not armedCasts[unitToken] then return end
