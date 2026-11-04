@@ -1,9 +1,9 @@
 -- Config.lua - Configuration panel (one tabbed window)
 
-Snitch = Snitch or {}
-Snitch.Config = {}
+Tattle = Tattle or {}
+Tattle.Config = {}
 
-local Config = Snitch.Config
+local Config = Tattle.Config
 
 -- ============================================================================
 -- Localize Globals (Performance)
@@ -35,7 +35,11 @@ local UIDropDownMenu_SetText = UIDropDownMenu_SetText
 -- ============================================================================
 
 local CONFIG_PANEL_WIDTH  = 700
-local CONFIG_PANEL_HEIGHT = 650
+-- 700 rather than 650 because the tallest tab is now the Silencers one, which
+-- shares the standard alert controls *and* adds a watch list section above its
+-- spell ID editor. Tabs are not clipped, so a too-short panel would spill the
+-- editor over the window's bottom edge.
+local CONFIG_PANEL_HEIGHT = 700
 
 local TAB_BUTTON_LEFT = 20
 local TAB_BUTTON_Y    = -35
@@ -47,7 +51,7 @@ local TAB_RIGHT  = -20
 local TAB_BOTTOM = 20
 
 local CONTENT_WIDTH  = CONFIG_PANEL_WIDTH - TAB_LEFT + TAB_RIGHT            -- 660
-local CONTENT_HEIGHT = CONFIG_PANEL_HEIGHT + TAB_TOP - TAB_BOTTOM           -- 560
+local CONTENT_HEIGHT = CONFIG_PANEL_HEIGHT + TAB_TOP - TAB_BOTTOM           -- 610
 
 local LABEL_X       = 20
 local DROPDOWN_X    = 90
@@ -72,13 +76,18 @@ local SCOPE_OPTIONS = {
     {text = "Only me",     value = "self"},
 }
 
--- "PRIVATE" = chat window only (no SendChatMessage)
+-- "PRIVATE" = chat window only (no SendChatMessage).
+-- Raid and Party are resolved against the group you are actually in before they
+-- are sent (see Tattle.ResolveChatChannel), which is what makes "Raid" work in a
+-- Looking for Raid group instead of vanishing. "Instance" asks for that resolved
+-- channel directly.
 local CHAT_TYPE_OPTIONS = {
     {text = "Private (console only)", value = "PRIVATE"},
-    {text = "Say",    value = "SAY"},
-    {text = "Yell",   value = "YELL"},
-    {text = "Party",  value = "PARTY"},
-    {text = "Raid",   value = "RAID"},
+    {text = "Say",       value = "SAY"},
+    {text = "Yell",      value = "YELL"},
+    {text = "Party",     value = "PARTY"},
+    {text = "Raid",      value = "RAID"},
+    {text = "Instance",  value = "INSTANCE_CHAT"},
 }
 
 local ALERT_COLORS = {
@@ -178,6 +187,11 @@ local function AddDropdown(container, y, labelText, width, options, getValue, se
     return dropdown
 end
 
+-- Exposed so a module can add its own controls to its tab (see
+-- Modules/Silencer.lua's extraContent) without reinventing the widgets.
+Config.AddCheckbox = AddCheckbox
+Config.AddDropdown = AddDropdown
+
 -- Labelled OptionsSliderTemplate with a value readout under the handle.
 function Config:GetSlider(container, y, labelText, width, minValue, maxValue, stepValue, initialValue, lowText, highText, formatFunc, onValueChanged)
     local label = container:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -229,7 +243,7 @@ ShowTab = function(index)
 
     local tab = panel.tabs[index]
     if tab.warning then
-        if SnitchDB.enabled then tab.warning:Hide() else tab.warning:Show() end
+        if TattleDB.enabled then tab.warning:Hide() else tab.warning:Show() end
     end
     for _, refresh in ipairs(tab.refreshers) do
         refresh()
@@ -277,7 +291,7 @@ local function BuildAboutTab(container)
 
     local nameLabel = container:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
     nameLabel:SetPoint("TOPLEFT", 0, y)
-    nameLabel:SetText("Snitch v" .. (Snitch.VERSION or "Unknown"))
+    nameLabel:SetText("Tattle v" .. (Tattle.VERSION or "Unknown"))
     y = y - 34
 
     local desc = container:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
@@ -285,8 +299,8 @@ local function BuildAboutTab(container)
     desc:SetPoint("TOPRIGHT", 0, y)
     desc:SetJustifyH("LEFT")
     desc:SetSpacing(3)
-    desc:SetText("Watches your party and raid for casts that can be used to grief the group: the SwapBlaster toy, out-of-combat Life Grip from a Priest, and out-of-combat Rescue from an Evoker. Every module has its own alert settings on its own tab.")
-    y = y - 56
+    desc:SetText("Watches your party and raid for the ways a group member can move you around: the Swapblaster toy, out-of-combat Life Grip from a Priest, and out-of-combat Rescue from an Evoker. A fourth module tracks who in the group is wearing a Neural Silencer (the aura that blocks all three) and can keep a small list of them, plus whoever is targeting you, on screen. Every module has its own alert settings on its own tab.")
+    y = y - 70
 
     local commandHeader = container:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     commandHeader:SetPoint("TOPLEFT", 0, y)
@@ -299,13 +313,13 @@ local function BuildAboutTab(container)
     commands:SetJustifyH("LEFT")
     commands:SetSpacing(3)
     commands:SetText(
-        "/snitch          open or close this window\n" ..
-        "/snitch on       enable all alerts\n" ..
-        "/snitch off      disable all alerts\n" ..
-        "/snitch debug    toggle debug printing\n" ..
-        "/snitch probe    toggle the event probe\n" ..
-        "/snitch status   print the current settings\n" ..
-        "/snitch version  print the version"
+        "/tattle          open or close this window\n" ..
+        "/tattle on       enable all alerts\n" ..
+        "/tattle off      disable all alerts\n" ..
+        "/tattle debug    toggle debug printing\n" ..
+        "/tattle probe    toggle the event probe\n" ..
+        "/tattle status   print the current settings\n" ..
+        "/tattle version  print the version"
     )
     y = y - 110
 
@@ -320,12 +334,13 @@ local function BuildAboutTab(container)
     notes:SetJustifyH("LEFT")
     notes:SetSpacing(3)
     notes:SetText(
-        "Alerts only fire while you are in a party or a raid. Out of a group, Snitch stays silent.\n\n" ..
+        "Alerts only fire while you are in a party or a raid. Out of a group, Tattle stays silent: nobody can swap, grip or rescue you without one, so there is nothing to look at. A Swapblaster cast start is not even evaluated while its caster is fighting, because the toy cannot be used in combat - Life Grip and Rescue still are.\n\n" ..
+        "A chat alert set to Raid is resolved against the group you are actually in, so it also lands in a Looking for Raid raid.\n\n" ..
         "Blizzard's 12.x rules shape what can be detected. COMBAT_LOG_EVENT_UNFILTERED was removed in 12.0.0, " ..
         "so no cast event says who another player's spell was aimed at, and inside instances the spell ID is a " ..
-        "secret value (Snitch matches spell names instead). Life Grip and Rescue put an aura on the victim, so " ..
+        "secret value (Tattle matches spell names instead). Life Grip and Rescue put an aura on the victim, so " ..
         "those can be attributed by name. Swapblaster marks nobody, so it is reported without a victim. Run " ..
-        "/snitch probe to confirm what your client actually exposes before you trust a spell ID or an \"Only me\" filter."
+        "/tattle probe to confirm what your client actually exposes before you trust a spell ID or an \"Only me\" filter."
     )
 end
 
@@ -336,14 +351,14 @@ end
 local function BuildGeneralTab(container)
     local y = 0
 
-    AddCheckbox(container, y, "Enable Snitch",
-        function() return SnitchDB.enabled end,
-        function(value) SnitchDB.enabled = value end)
+    AddCheckbox(container, y, "Enable Tattle",
+        function() return TattleDB.enabled end,
+        function(value) TattleDB.enabled = value end)
     y = y - 36
 
     AddCheckbox(container, y, "Debug mode",
-        function() return SnitchDB.debug end,
-        function(value) SnitchDB.debug = value end)
+        function() return TattleDB.debug end,
+        function(value) TattleDB.debug = value end)
     y = y - 42
 
     local probeBtn = CreateFrame("Button", nil, container, "UIPanelButtonTemplate")
@@ -351,7 +366,7 @@ local function BuildGeneralTab(container)
     probeBtn:SetPoint("TOPLEFT", 0, y)
     probeBtn:SetText("Toggle Event Probe")
     probeBtn:SetScript("OnClick", function()
-        Snitch.ToggleProbe()
+        Tattle.ToggleProbe()
     end)
     y = y - 34
 
@@ -361,7 +376,7 @@ local function BuildGeneralTab(container)
     probeHelp:SetJustifyH("LEFT")
     probeHelp:SetSpacing(3)
     probeHelp:SetText(
-        "/snitch probe prints every UNIT_SPELLCAST_* event to chat with the spell name, who cast it, " ..
+        "/tattle probe prints every UNIT_SPELLCAST_* event to chat with the spell name, who cast it, " ..
         "whether the caster is you, and whether any destination unit is exposed. Use it in a group to " ..
         "confirm spell IDs on the module tabs and to see whether \"Only me\" monitoring is actually " ..
         "possible in the current build."
@@ -386,7 +401,7 @@ end
 -- ============================================================================
 
 local function BuildScreenAlertTab(container)
-    local settings = SnitchDB.screenAlert
+    local settings = TattleDB.screenAlert
     if not settings then return end
 
     local swatches = {}
@@ -402,7 +417,7 @@ local function BuildScreenAlertTab(container)
     end
 
     local fontOptions = {}
-    local fonts = Snitch.ScreenAlert and Snitch.ScreenAlert.FONTS or {}
+    local fonts = Tattle.ScreenAlert and Tattle.ScreenAlert.FONTS or {}
     for i, font in ipairs(fonts) do
         fontOptions[i] = {text = font.name, value = i}
     end
@@ -414,7 +429,7 @@ local function BuildScreenAlertTab(container)
             function() return settings.font or 1 end,
             function(value)
                 settings.font = value
-                if Snitch.ScreenAlert then Snitch.ScreenAlert:ApplySettings() end
+                if Tattle.ScreenAlert then Tattle.ScreenAlert:ApplySettings() end
             end)
     end
     y = y - DROPDOWN_ROW
@@ -424,7 +439,7 @@ local function BuildScreenAlertTab(container)
         function(value) return tostring(value) end,
         function(value)
             settings.fontSize = value
-            if Snitch.ScreenAlert then Snitch.ScreenAlert:ApplySettings() end
+            if Tattle.ScreenAlert then Tattle.ScreenAlert:ApplySettings() end
         end)
     y = y - SLIDER_ROW
 
@@ -462,7 +477,7 @@ local function BuildScreenAlertTab(container)
                 b = color.b,
                 a = (settings.color and settings.color.a) or 1,
             }
-            if Snitch.ScreenAlert then Snitch.ScreenAlert:ApplySettings() end
+            if Tattle.ScreenAlert then Tattle.ScreenAlert:ApplySettings() end
             RefreshSwatches()
         end)
         swatch:SetScript("OnEnter", function(self)
@@ -483,7 +498,7 @@ local function BuildScreenAlertTab(container)
         function() return settings.showBackground end,
         function(value)
             settings.showBackground = value
-            if Snitch.ScreenAlert then Snitch.ScreenAlert:ApplySettings() end
+            if Tattle.ScreenAlert then Tattle.ScreenAlert:ApplySettings() end
         end)
     y = y - 38
 
@@ -493,14 +508,14 @@ local function BuildScreenAlertTab(container)
     positionBtn:SetPoint("TOPLEFT", 0, y)
     positionBtn:SetText("Reposition Alert")
     positionBtn:SetScript("OnClick", function(self)
-        if not Snitch.ScreenAlert then return end
+        if not Tattle.ScreenAlert then return end
 
         isDragMode = not isDragMode
         if isDragMode then
-            Snitch.ScreenAlert:EnableDragMode()
+            Tattle.ScreenAlert:EnableDragMode()
             self:SetText("Done Repositioning")
         else
-            Snitch.ScreenAlert:DisableDragMode()
+            Tattle.ScreenAlert:DisableDragMode()
             self:SetText("Reposition Alert")
         end
     end)
@@ -510,8 +525,8 @@ local function BuildScreenAlertTab(container)
     testBtn:SetPoint("LEFT", positionBtn, "RIGHT", 10, 0)
     testBtn:SetText("Test Alert")
     testBtn:SetScript("OnClick", function()
-        if Snitch.ScreenAlert then
-            Snitch.ScreenAlert:Show("This is a test alert!\nResize and reposition as needed.")
+        if Tattle.ScreenAlert then
+            Tattle.ScreenAlert:Show("This is a test alert!\nResize and reposition as needed.")
         end
     end)
     y = y - 38
@@ -534,7 +549,10 @@ end
 
 local function BuildSpellIDEditor(container, moduleSettings, defaults, labelY)
     local boxTop = labelY - 30
-    local boxHeight = math_min(EDITOR_HEIGHT, CONTENT_HEIGHT + boxTop - 24)
+    -- Shrink to whatever the tab has left, but never below a usable scribble of
+    -- a box: a tall tab (the Silencer one adds a watch list section) would
+    -- otherwise end up with a zero or negative height editor.
+    local boxHeight = math_max(64, math_min(EDITOR_HEIGHT, CONTENT_HEIGHT + boxTop - 24))
 
     local box = CreateFrame("Frame", nil, container, "BackdropTemplate")
     box:SetSize(EDITOR_WIDTH, boxHeight)
@@ -637,17 +655,15 @@ local function BuildSpellIDEditor(container, moduleSettings, defaults, labelY)
     return box, status
 end
 
-local function BuildModuleTabContent(container, moduleId)
-    local moduleSettings = SnitchDB.modules and SnitchDB.modules[moduleId]
-    if not moduleSettings or not moduleSettings.alerts then return end
-    local alerts = moduleSettings.alerts
+-- A module tab is assembled from sections so a module that needs extra options
+-- (the Silencer watch list) reuses the same controls instead of forking the
+-- whole tab. Each section takes the current `y` and returns the next one.
 
-    local y = 0
-
+local function AddDisabledWarning(container, y)
     local warning = CreateFrame("Frame", nil, container, "BackdropTemplate")
     warning:SetHeight(34)
-    warning:SetPoint("TOPLEFT", container, "TOPLEFT", 0, -4)
-    warning:SetPoint("TOPRIGHT", container, "TOPRIGHT", 0, -4)
+    warning:SetPoint("TOPLEFT", container, "TOPLEFT", 0, y - 4)
+    warning:SetPoint("TOPRIGHT", container, "TOPRIGHT", 0, y - 4)
     warning:SetBackdrop({
         bgFile = "Interface/Tooltips/UI-Tooltip-Background",
         edgeFile = "Interface/Tooltips/UI-Tooltip-Border",
@@ -661,16 +677,22 @@ local function BuildModuleTabContent(container, moduleId)
     warning.text:SetWidth(CONTENT_WIDTH - 16)
     warning.text:SetJustifyH("CENTER")
     warning.text:SetTextColor(1, 0.25, 0.25)
-    warning.text:SetText("WARNING: Snitch is globally disabled (type /snitch on to enable) - this module will not alert")
+    warning.text:SetText("WARNING: Tattle is globally disabled (type /tattle on to enable) - this module will not alert")
     warning:Hide()
     container.warning = warning
-    y = y - 46
+    return y - 46
+end
 
+local function AddEnableControl(container, moduleSettings, y)
     AddCheckbox(container, y, "Enable module",
         function() return moduleSettings.enabled end,
         function(value) moduleSettings.enabled = value end)
-    y = y - CHECKBOX_ROW
+    return y - CHECKBOX_ROW
+end
 
+-- Only cast-watching modules get a scope. A module that never filters a cast
+-- (it watches auras instead) would be showing a control it does not honour.
+local function AddScopeControl(container, moduleSettings, y)
     AddDropdown(container, y, "Monitor:", 150, SCOPE_OPTIONS,
         function() return moduleSettings.scope or "group" end,
         function(value) moduleSettings.scope = value end)
@@ -680,9 +702,11 @@ local function BuildModuleTabContent(container, moduleId)
     scopeNote:SetPoint("TOPLEFT", LABEL_X, y)
     scopeNote:SetPoint("TOPRIGHT", 0, y)
     scopeNote:SetJustifyH("LEFT")
-    scopeNote:SetText("\"Only me\" drops a cast only when it can prove it missed you. Life Grip and Rescue mark their victim with an aura, so they can be attributed; SwapBlaster marks nobody, so it is always reported.")
-    y = y - 30
+    scopeNote:SetText("\"Only me\" drops a cast only when it can prove it missed you. Life Grip and Rescue mark their victim with an aura, so they can be attributed; Swapblaster marks nobody, so it is always reported.")
+    return y - 30
+end
 
+local function AddAlertControls(container, alerts, y)
     AddCheckbox(container, y, "Console output",
         function() return alerts.console end,
         function(value) alerts.console = value end)
@@ -719,8 +743,10 @@ local function BuildModuleTabContent(container, moduleId)
     AddCheckbox(container, y, "Screen warning (appearance is set on the Screen Alerts tab)",
         function() return alerts.screen end,
         function(value) alerts.screen = value end)
-    y = y - CHECKBOX_ROW
+    return y - CHECKBOX_ROW
+end
 
+local function AddSpellIDSection(container, moduleSettings, moduleId, y)
     local spellLabel = container:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     spellLabel:SetPoint("TOPLEFT", 0, y)
     spellLabel:SetText("Spell IDs (one per line or comma separated)")
@@ -730,8 +756,29 @@ local function BuildModuleTabContent(container, moduleId)
     divider:SetSize(EDITOR_WIDTH, 1)
     divider:SetPoint("TOPLEFT", 0, y - 26)
 
-    local defaults = (Snitch.GetModuleDefaults and Snitch.GetModuleDefaults(moduleId)) or {spellIDs = {}}
+    local defaults = (Tattle.GetModuleDefaults and Tattle.GetModuleDefaults(moduleId)) or {spellIDs = {}}
     BuildSpellIDEditor(container, moduleSettings, defaults, y)
+end
+
+local function BuildModuleTabContent(container, moduleId)
+    local moduleSettings = TattleDB.modules and TattleDB.modules[moduleId]
+    if not moduleSettings or not moduleSettings.alerts then return end
+    local module = Tattle.modules and Tattle.modules[moduleId]
+
+    local y = AddDisabledWarning(container, 0)
+    y = AddEnableControl(container, moduleSettings, y)
+    if not (module and module.noScope) then
+        y = AddScopeControl(container, moduleSettings, y)
+    end
+    y = AddAlertControls(container, moduleSettings.alerts, y)
+
+    -- Anything the module itself wants on its tab, between the shared alert
+    -- controls and the spell ID editor.
+    if module and module.extraContent then
+        y = module.extraContent(container, moduleId, moduleSettings, y) or y
+    end
+
+    AddSpellIDSection(container, moduleSettings, moduleId, y)
 end
 
 -- ============================================================================
@@ -751,13 +798,14 @@ end
 
 function Config:BuildModuleTabs()
     self.moduleTabs = {}
-    for _, moduleId in ipairs(Snitch.moduleOrder or {}) do
-        local module = Snitch.modules[moduleId]
+    for _, moduleId in ipairs(Tattle.moduleOrder or {}) do
+        local module = Tattle.modules[moduleId]
         if module then
             self:RegisterModuleTab(moduleId, {
                 name         = module.tabName or module.name,
                 buildContent = module.buildContent,
             })
+            -- (extraContent is read from the module record by the tab builder)
         end
     end
 end
@@ -767,7 +815,7 @@ end
 -- ============================================================================
 
 local function CreateConfigPanel()
-    local panel = CreateFrame("Frame", "SnitchConfigPanel", UIParent, "BasicFrameTemplateWithInset")
+    local panel = CreateFrame("Frame", "TattleConfigPanel", UIParent, "BasicFrameTemplateWithInset")
     panel:SetSize(CONFIG_PANEL_WIDTH, CONFIG_PANEL_HEIGHT)
     panel:SetPoint("CENTER")
     panel:SetMovable(true)
@@ -783,7 +831,7 @@ local function CreateConfigPanel()
 
     panel.title = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
     panel.title:SetPoint("TOP", 0, -5)
-    panel.title:SetText("Snitch")
+    panel.title:SetText("Tattle")
 
     -- Hidden measuring string: GetStringWidth on the template's own font is what
     -- lets tab buttons be packed left to right without hardcoding widths.
@@ -847,18 +895,18 @@ end
 -- ============================================================================
 
 function Config:RegisterInterfaceOptions()
-    local settingsPanel = CreateFrame("Frame", "SnitchSettingsPanel")
-    settingsPanel.name = "Snitch"
+    local settingsPanel = CreateFrame("Frame", "TattleSettingsPanel")
+    settingsPanel.name = "Tattle"
 
     local title = settingsPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 16, -16)
-    title:SetText("Snitch")
+    title:SetText("Tattle")
 
     local desc = settingsPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     desc:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
     desc:SetPoint("TOPRIGHT", settingsPanel, "TOPRIGHT", -16, -32)
     desc:SetJustifyH("LEFT")
-    desc:SetText("Alerts when a group member casts something that can be used to grief the group: SwapBlaster, Life Grip, or Rescue.")
+    desc:SetText("Alerts when a group member casts something that can be used to grief the group: Swapblaster, Life Grip, or Rescue. Also tracks the group's Neural Silencer wearers.")
 
     local openBtn = CreateFrame("Button", nil, settingsPanel, "UIPanelButtonTemplate")
     openBtn:SetSize(180, 30)
@@ -871,9 +919,9 @@ function Config:RegisterInterfaceOptions()
 
     local slashInfo = settingsPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     slashInfo:SetPoint("TOPLEFT", openBtn, "BOTTOMLEFT", 0, -16)
-    slashInfo:SetText("You can also use the slash command: /snitch")
+    slashInfo:SetText("You can also use the slash command: /tattle")
 
-    local category = Settings.RegisterCanvasLayoutCategory(settingsPanel, "Snitch")
+    local category = Settings.RegisterCanvasLayoutCategory(settingsPanel, "Tattle")
     Settings.RegisterAddOnCategory(category)
     self.category = category
 end

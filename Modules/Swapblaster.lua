@@ -1,6 +1,6 @@
--- Modules/SwapBlaster.lua
+-- Modules/Swapblaster.lua
 
-Snitch = Snitch or {}
+Tattle = Tattle or {}
 
 local string_format = string.format
 local ipairs = ipairs
@@ -11,7 +11,7 @@ local UnitCastingInfo = UnitCastingInfo
 local UnitChannelInfo = UnitChannelInfo
 
 local MODULE_ID          = "swapblaster"
-local MODULE_NAME        = "SwapBlaster Detector"
+local MODULE_NAME        = "Swapblaster Detector"
 local MODULE_DESCRIPTION = "Alerts when a group member fires the Swapblaster toy"
 
 -- Verified against the live 12.1.5 spell database (wowhead.com/spell=161399).
@@ -25,14 +25,13 @@ local SWAPBLASTER_SPELL_IDS = {
     161399,
 }
 
--- "Neurosilencer" (and the old ID 470344) does not exist -- 470344 resolves to
--- an unrelated hidden test aura called "Supercharged". The real thing is the
--- "Neural Silencer" aura: 156779 from the item, 384129 for the craftable Mk3.
--- Both apply the same 12-hour "Immune to some annoyances" aura that blocks
--- Swapblaster and Leap of Faith, so it is worth knowing who is wearing one.
-local NEURAL_SILENCER_SPELL_IDS = {
-    156779,
-    384129,
+-- The backfire a caster eats when the Swapblaster's target was protected. It is
+-- the only event that says "a Swapblaster was fired and did nothing", and since
+-- the swap itself marks nobody it is also the only chance to call an attempt
+-- what it was. Verified against the live 12.1.5 database (wowhead.com/
+-- spell=182081). Not user-editable: it is a signal, not a watched cast.
+local BACKFIRE_SPELL_IDS = {
+    182081,
 }
 
 -- Midnight 12.0+ makes the spellID argument from UNIT_SPELLCAST_* a "secret
@@ -43,16 +42,19 @@ local NEURAL_SILENCER_SPELL_IDS = {
 -- So: at Initialize() resolve our own plain IDs into spell names and cache
 -- them; in OnEvent turn the incoming secret into a name with
 -- C_Spell.GetSpellInfo and compare names.
-local swapBlasterNames    = {}  -- populated in Initialize()
-local neuralSilencerNames = {}  -- populated in Initialize()
+local swapblasterNames = {}  -- populated in Initialize()
+local backfireNames    = {}  -- populated in Initialize()
+
+-- The Neural Silencer side of things is shared: Modules/Silencer.lua owns the
+-- spell IDs and fills Tattle.silencerNames, every module reads the result.
 
 -- Cast state keyed on unitToken (a plain string, always safe).
 local activeCasts = {}
 
 -- The IDs the user entered in-game win; otherwise the shipped ones apply.
--- An empty or missing SnitchDB list falls back to the built-in default.
+-- An empty or missing TattleDB list falls back to the built-in default.
 local function GetWatchedSpellIDs()
-    local settings = Snitch.GetModuleSettings(MODULE_ID)
+    local settings = Tattle.GetModuleSettings(MODULE_ID)
     local stored = settings and settings.spellIDs
     if type(stored) == "table" and #stored > 0 then return stored end
     return SWAPBLASTER_SPELL_IDS
@@ -62,21 +64,28 @@ end
 -- Helpers
 -- ============================================================================
 
-local function IsWatchedSpell(spellID, nameSet)
-    -- spellID may be a secret value -- GetSpellInfo accepts it and hands back a
+local function IsNamedSpell(spellID, nameSet)
+    -- spellID may be a secret value -- the resolver accepts it and hands back a
     -- safe plain string name. Never compare or index with spellID directly.
-    local info = C_Spell.GetSpellInfo(spellID)
-    if not info or not info.name then return false end
-    return nameSet[info.name] == true
+    local name = Tattle.ResolveSpellName(spellID)
+    if not name then return false end
+    return nameSet[name] == true
+end
+
+-- The dispatcher resolves the name once per event and hands it over; startup and
+-- any caller without a resolved name still get the lookup.
+local function MatchesSpell(spellName, spellID, nameSet)
+    if spellName then return nameSet[spellName] == true end
+    return IsNamedSpell(spellID, nameSet)
 end
 
 local function NeuralSilencerNote(wearers)
     if #wearers == 0 then return "" end
-    return string_format(" (Neural Silencer worn by %s)", Snitch.FormatList(wearers))
+    return string_format(" (Neural Silencer worn by %s)", Tattle.FormatList(wearers))
 end
 
 local function WearersNow()
-    return Snitch.AuraCarrierNames(neuralSilencerNames, "HELPFUL")
+    return Tattle.SilencerWearerNames()
 end
 
 -- Swap is channeled, so its cast window comes from UnitChannelInfo; a plain cast
@@ -141,33 +150,83 @@ end
 -- Event Handler
 -- ============================================================================
 
+-- A completed swap. When the caster is the protected one, that is the story
+-- worth telling: they fired a movement toy at someone who cannot answer in kind.
+-- The generic "worn by" note is dropped in that case, since the clause already
+-- names the wearer. Only ever for an out of combat cast -- the core only lets an
+-- outOfCombatOnly module see a cast start while the caster is fighting.
+local function CompletionMessage(sourceName, unitToken, wearers)
+    if not Tattle.UnitInCombat(unitToken) then
+        local clause = Tattle.SilencerCheatClause(unitToken, sourceName)
+        if clause then
+            return string_format("%s used Swapblaster%s", sourceName, clause)
+        end
+    end
+    return string_format("%s used Swapblaster%s", sourceName, NeuralSilencerNote(wearers))
+end
+
+-- "Swapblaster Explosion" is what the caster eats when the player they tried to
+-- swap with was protected. It is the one event that says "a Swapblaster was fired
+-- and did nothing", and because the swap itself marks nobody it is the only
+-- chance to call a blocked attempt what it was. The victim still cannot be named,
+-- but a backfire can only be caused by a protected player, so the group's
+-- Neural Silencer wearers are the candidate list.
+local function HandleBackfire(unitToken, sourceName)
+    if not sourceName then return end
+
+    -- Whichever half of the cast we hear about last must not announce it twice.
+    local cast = activeCasts[unitToken]
+    if cast then
+        if cast.resolved then return end
+        cast.resolved = true
+    end
+
+    local message = Tattle.BlockedBySilencer(sourceName, "Swapblaster", nil, unitToken)
+        or string_format("%s's Swapblaster backfired", sourceName)
+    Tattle.SendAlert(message, MODULE_ID)
+    Tattle.DebugPrint("Swapblaster backfire:", sourceName)
+end
+
 -- Swap applies no aura to either side, so nothing about this spell can say who
 -- got swapped with whom: the destination lived only in the combat log. These
--- alerts name the caster and leave the victim to your own eyes.
-local function OnEvent(event, unitToken, castGUID, spellID)
-    if not IsWatchedSpell(spellID, swapBlasterNames) then return end
-    if not Snitch.IsGroupMemberToken(unitToken) then return end
+-- alerts name the caster and leave the victim to your own eyes -- except when the
+-- target was protected, which the backfire announces.
+local function OnEvent(event, unitToken, castGUID, spellID, spellName)
+    -- A guard, not the primary filter: the dispatcher has already dropped casts
+    -- by anyone who is not one of your group's players. It stays because that
+    -- filter is per-event, and another module's `allCasters` flag would widen the
+    -- same event for everybody.
+    if not Tattle.IsGroupMemberToken(unitToken) then return end
+
+    local isBackfire = MatchesSpell(spellName, spellID, backfireNames)
+    if not isBackfire and not MatchesSpell(spellName, spellID, swapblasterNames) then return end
+
+    local sourceName = Tattle.GetUnitShortName(unitToken)
+
+    -- The backfire is a different spell from the cast, so it resolves here,
+    -- before the watched-spell and scope filters that govern the cast itself.
+    if isBackfire then
+        HandleBackfire(unitToken, sourceName)
+        return
+    end
+
     -- scope == "self" only drops casts we can prove missed you, which for this
     -- spell is never, so a Swapblaster aimed at a friend is still reported.
-    if Snitch.ShouldReport(MODULE_ID, unitToken) == false then return end
-
-    local sourceName = Snitch.GetUnitShortName(unitToken)
-    if not sourceName then return end
+    if Tattle.ShouldReport(MODULE_ID, unitToken) == false then return end
 
     if event == "UNIT_SPELLCAST_START" or event == "UNIT_SPELLCAST_CHANNEL_START" then
         local cast = ArmCast(unitToken, event == "UNIT_SPELLCAST_CHANNEL_START")
         if not cast then return end
 
         local note = NeuralSilencerNote(cast.wearers)
-        Snitch.SendAlert(string_format("%s is casting SwapBlaster%s", sourceName, note), MODULE_ID)
-        Snitch.DebugPrint("SwapBlaster START:", sourceName, note)
+        Tattle.SendAlert(string_format("%s is casting Swapblaster%s", sourceName, note), MODULE_ID)
+        Tattle.DebugPrint("Swapblaster START:", sourceName, note)
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         if not ClaimCast(unitToken) then return end
 
-        local note = NeuralSilencerNote(WearersNow())
-        Snitch.SendAlert(string_format("%s used SwapBlaster%s", sourceName, note), MODULE_ID)
-        Snitch.DebugPrint("SwapBlaster SUCCESS:", sourceName, note)
+        Tattle.SendAlert(CompletionMessage(sourceName, unitToken, WearersNow()), MODULE_ID)
+        Tattle.DebugPrint("Swapblaster SUCCESS:", sourceName)
 
     elseif event == "UNIT_SPELLCAST_CHANNEL_STOP" then
         local cast = activeCasts[unitToken]
@@ -175,16 +234,17 @@ local function OnEvent(event, unitToken, castGUID, spellID)
         cast.resolved = true
 
         local finished = FinishedAsExpected(cast)
-        local note = NeuralSilencerNote(WearersNow())
 
         if finished == true then
-            Snitch.SendAlert(string_format("%s used SwapBlaster%s", sourceName, note), MODULE_ID)
-        elseif finished == false then
-            Snitch.SendAlert(string_format("%s's SwapBlaster was cut short%s", sourceName, note), MODULE_ID)
+            Tattle.SendAlert(CompletionMessage(sourceName, unitToken, WearersNow()), MODULE_ID)
         else
-            Snitch.SendAlert(string_format("%s's SwapBlaster cast ended%s", sourceName, note), MODULE_ID)
+            -- "cut short" when the channel clearly stopped early, and a plainer
+            -- "cast ended" when there was no window to measure against.
+            local note = NeuralSilencerNote(WearersNow())
+            Tattle.SendAlert(string_format("%s's Swapblaster %s%s",
+                sourceName, finished == false and "was cut short" or "cast ended", note), MODULE_ID)
         end
-        Snitch.DebugPrint("SwapBlaster CHANNEL_STOP:", sourceName, finished)
+        Tattle.DebugPrint("Swapblaster CHANNEL_STOP:", sourceName, finished)
 
     elseif event == "UNIT_SPELLCAST_FAILED" then
         local cast = activeCasts[unitToken]
@@ -192,16 +252,16 @@ local function OnEvent(event, unitToken, castGUID, spellID)
         cast.resolved = true
 
         local note = NeuralSilencerNote(cast.wearers)
-        Snitch.SendAlert(string_format("%s's SwapBlaster failed%s", sourceName, note), MODULE_ID)
-        Snitch.DebugPrint("SwapBlaster FAILED:", sourceName, note)
+        Tattle.SendAlert(string_format("%s's Swapblaster failed%s", sourceName, note), MODULE_ID)
+        Tattle.DebugPrint("Swapblaster FAILED:", sourceName, note)
 
     elseif event == "UNIT_SPELLCAST_INTERRUPTED" then
         local cast = activeCasts[unitToken]
         if not cast or cast.resolved then return end
         cast.resolved = true
 
-        Snitch.SendAlert(string_format("%s's SwapBlaster was interrupted", sourceName), MODULE_ID)
-        Snitch.DebugPrint("SwapBlaster INTERRUPTED:", sourceName)
+        Tattle.SendAlert(string_format("%s's Swapblaster was interrupted", sourceName), MODULE_ID)
+        Tattle.DebugPrint("Swapblaster INTERRUPTED:", sourceName)
     end
 end
 
@@ -210,38 +270,48 @@ end
 -- ============================================================================
 
 local function Initialize()
-    Snitch.DebugPrint("SwapBlaster module initialized")
+    Tattle.DebugPrint("Swapblaster module initialized")
 
     -- Resolve spell IDs to names while they are still safe plain numbers.
     -- OnEvent uses these name sets to identify secret-value spellIDs.
     for _, id in ipairs(GetWatchedSpellIDs()) do
         local info = C_Spell.GetSpellInfo(id)
         if info and info.name then
-            swapBlasterNames[info.name] = true
-            Snitch.DebugPrint("  Watching:", info.name, "(" .. id .. ")")
+            swapblasterNames[info.name] = true
+            Tattle.DebugPrint("  Watching:", info.name, "(" .. id .. ")")
         else
-            Snitch.DebugPrint("  WARNING: spell ID", id, "not found — may need updating")
+            Tattle.DebugPrint("  WARNING: spell ID", id, "not found — may need updating")
         end
     end
 
-    for _, id in ipairs(NEURAL_SILENCER_SPELL_IDS) do
+    -- The backfire is not part of the editable watched-spell list: it is a
+    -- signal this module reads, not a cast the user is choosing to follow.
+    for _, id in ipairs(BACKFIRE_SPELL_IDS) do
         local info = C_Spell.GetSpellInfo(id)
         if info and info.name then
-            neuralSilencerNames[info.name] = true
-            Snitch.DebugPrint("  Neural Silencer:", info.name, "(" .. id .. ")")
+            backfireNames[info.name] = true
+            Tattle.DebugPrint("  Backfire signal:", info.name, "(" .. id .. ")")
         else
-            Snitch.DebugPrint("  WARNING: Neural Silencer spell ID", id, "not found")
+            Tattle.DebugPrint("  WARNING: Swapblaster backfire spell ID", id, "not found")
         end
     end
+
+    -- Hand the names to the core, so it can drop every cast event that is not
+    -- one of ours before it reaches us.
+    Tattle.WatchSpellNames(swapblasterNames)
+    Tattle.WatchSpellNames(backfireNames)
 end
 
-Snitch:RegisterModule(MODULE_ID, {
+Tattle:RegisterModule(MODULE_ID, {
     name        = MODULE_NAME,
-    tabName     = "SwapBlaster",   -- short: six tabs have to fit one row
+    tabName     = "Swapblaster",   -- short: six tabs have to fit one row
     description = MODULE_DESCRIPTION,
     initialize  = Initialize,
     onEvent     = OnEvent,
     spellIDs    = SWAPBLASTER_SPELL_IDS,
+    -- "Cannot be used in combat" is on the item: while the caster is fighting,
+    -- a cast start cannot exist, so the core skips the evaluation.
+    outOfCombatOnly = true,
     events      = {
         "UNIT_SPELLCAST_START",
         "UNIT_SPELLCAST_SUCCEEDED",

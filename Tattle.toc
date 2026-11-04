@@ -1,0 +1,18 @@
+## Interface: 120001, 120000
+## Title: Tattle
+## IconTexture: Interface\AddOns\Tattle\TattleTurtle
+## Notes: Alerts when a group member uses Swapblaster, Life Grip or Rescue, and tracks the group's Neural Silencer wearers
+## Author: Tarball-Whisperwind [A]
+## Version: 0.2.0-alpha.1
+## SavedVariables: TattleDB
+
+## X-Curse-Project-ID: 1782380
+
+EventListener.lua
+Core.lua
+ScreenAlert.lua
+Config.lua
+Modules\Swapblaster.lua
+Modules\LifeGrip.lua
+Modules\Rescue.lua
+Modules\Silencer.lua

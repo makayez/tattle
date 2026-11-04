@@ -1,9 +1,9 @@
 -- ScreenAlert.lua - Custom screen notification system
 
-Snitch = Snitch or {}
-Snitch.ScreenAlert = {}
+Tattle = Tattle or {}
+Tattle.ScreenAlert = {}
 
-local ScreenAlert = Snitch.ScreenAlert
+local ScreenAlert = Tattle.ScreenAlert
 
 -- ============================================================================
 -- Localize Globals
@@ -35,7 +35,7 @@ local function CreateAlertFrame()
     if alertFrame then return alertFrame end
 
     -- Main container frame
-    local frame = CreateFrame("Frame", "SnitchScreenAlertFrame", UIParent)
+    local frame = CreateFrame("Frame", "TattleScreenAlertFrame", UIParent)
     frame:SetSize(400, 100)
     frame:SetPoint("TOP", UIParent, "TOP", 0, -200)
     frame:SetFrameStrata("HIGH")
@@ -72,8 +72,8 @@ end
 -- ============================================================================
 
 function ScreenAlert:InitializeSettings()
-    if not SnitchDB.screenAlert then
-        SnitchDB.screenAlert = {
+    if not TattleDB.screenAlert then
+        TattleDB.screenAlert = {
             fontSize = 32,
             font = 1,  -- Index into FONTS table
             color = {r = 1, g = 0.2, b = 0.2, a = 1},
@@ -94,7 +94,7 @@ function ScreenAlert:ApplySettings(frame)
     frame = frame or alertFrame
     if not frame then return end
 
-    local settings = SnitchDB.screenAlert
+    local settings = TattleDB.screenAlert
 
     -- Apply font
     local fontData = self.FONTS[settings.font] or self.FONTS[1]
@@ -122,7 +122,7 @@ function ScreenAlert:SavePosition()
     if not alertFrame then return end
 
     local point, relativeTo, relativePoint, xOffset, yOffset = alertFrame:GetPoint()
-    SnitchDB.screenAlert.position = {
+    TattleDB.screenAlert.position = {
         point = point,
         relativeTo = "UIParent",  -- Always relative to UIParent
         relativePoint = relativePoint,
@@ -151,7 +151,7 @@ function ScreenAlert:Show(message)
     frame:Show()
 
     -- Auto-hide after duration
-    local duration = SnitchDB.screenAlert.duration
+    local duration = TattleDB.screenAlert.duration
     activeTimer = C_Timer.NewTimer(duration, function()
         frame:Hide()
         activeTimer = nil

@@ -1,6 +1,6 @@
 -- Modules/Rescue.lua
 
-Snitch = Snitch or {}
+Tattle = Tattle or {}
 
 local string_format = string.format
 local ipairs = ipairs
@@ -38,9 +38,9 @@ local rescueNames = {}
 local activeCasts = {}
 
 -- The IDs the user entered in-game win; otherwise the shipped ones apply.
--- An empty or missing SnitchDB list falls back to the built-in default.
+-- An empty or missing TattleDB list falls back to the built-in default.
 local function GetWatchedSpellIDs()
-    local settings = Snitch.GetModuleSettings(MODULE_ID)
+    local settings = Tattle.GetModuleSettings(MODULE_ID)
     local stored = settings and settings.spellIDs
     if type(stored) == "table" and #stored > 0 then return stored end
     return RESCUE_SPELL_IDS
@@ -51,44 +51,55 @@ end
 -- ============================================================================
 
 local function IsWatchedSpell(spellID, nameSet)
-    local info = C_Spell.GetSpellInfo(spellID)
-    if not info or not info.name then return false end
-    return nameSet[info.name] == true
+    local name = Tattle.ResolveSpellName(spellID)
+    if not name then return false end
+    return nameSet[name] == true
+end
+
+-- The dispatcher resolves the spell name once per event and hands it over; the
+-- lookup is only for startup and callers that have no resolved name.
+local function WatchedSpell(spellName, spellID, nameSet)
+    if spellName then return nameSet[spellName] == true end
+    return IsWatchedSpell(spellID, nameSet)
 end
 
 -- Both halves of the flight carry an aura named "Rescue", so the caster has to
 -- be excluded before the remaining carriers can be read as the passenger.
 local function Passengers(casterToken)
-    return Snitch.AuraCarriers(rescueNames, "HELPFUL", casterToken)
+    return Tattle.AuraCarriers(rescueNames, "HELPFUL", casterToken)
 end
 
 -- ============================================================================
 -- Event Handler
 -- ============================================================================
 
-local function OnEvent(event, unitToken, castGUID, spellID)
-    if not IsWatchedSpell(spellID, rescueNames) then return end
-    if not Snitch.IsGroupMemberToken(unitToken) then return end
+local function OnEvent(event, unitToken, castGUID, spellID, spellName)
+    -- A guard, not the primary filter: the dispatcher has already dropped casts
+    -- by anyone who is not one of your group's players (pets, minions and NPCs
+    -- cannot cast this spell). It stays because that filter is per-event, and
+    -- another module's `allCasters` flag would widen the event for everybody.
+    if not Tattle.IsGroupMemberToken(unitToken) then return end
+    if not WatchedSpell(spellName, spellID, rescueNames) then return end
 
-    local sourceName = Snitch.GetUnitShortName(unitToken)
+    local sourceName = Tattle.GetUnitShortName(unitToken)
     if not sourceName then return end
 
     if event == "UNIT_SPELLCAST_START" then
         if UnitAffectingCombat(unitToken) then
-            Snitch.DebugPrint("Rescue (in combat, ignoring):", sourceName)
+            Tattle.DebugPrint("Rescue (in combat, ignoring):", sourceName)
             return
         end
 
-        if Snitch.ShouldReport(MODULE_ID, unitToken, nil) == false then return end
+        if Tattle.ShouldReport(MODULE_ID, unitToken, nil) == false then return end
 
         activeCasts[unitToken] = true
-        Snitch.SendAlert(string_format("%s is casting Rescue (out of combat)!", sourceName), MODULE_ID)
-        Snitch.DebugPrint("Rescue START OOC:", sourceName)
+        Tattle.SendAlert(string_format("%s is casting Rescue (out of combat)!", sourceName), MODULE_ID)
+        Tattle.DebugPrint("Rescue START OOC:", sourceName)
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         -- Rescue is instant, so no START ever precedes this.
         if UnitAffectingCombat(unitToken) then
-            Snitch.DebugPrint("Rescue success (in combat, ignoring):", sourceName)
+            Tattle.DebugPrint("Rescue success (in combat, ignoring):", sourceName)
             activeCasts[unitToken] = nil
             return
         end
@@ -96,31 +107,45 @@ local function OnEvent(event, unitToken, castGUID, spellID)
         local passengers = Passengers(unitToken)
         -- An empty list reads as "target unknown" inside ShouldReport, so a
         -- failed aura read cannot suppress the warning.
-        if Snitch.ShouldReport(MODULE_ID, unitToken, passengers) == false then
-            Snitch.DebugPrint("Rescue (scope self, someone else was carried):", sourceName)
+        if Tattle.ShouldReport(MODULE_ID, unitToken, passengers) == false then
+            Tattle.DebugPrint("Rescue (scope self, someone else was carried):", sourceName)
             return
         end
 
         activeCasts[unitToken] = nil
 
         if passengers[1] then
-            Snitch.SendAlert(string_format("%s used Rescue on %s!", sourceName, Snitch.TargetPhrase(passengers)), MODULE_ID)
+            Tattle.SendAlert(string_format("%s used Rescue on %s!", sourceName, Tattle.TargetPhrase(passengers)), MODULE_ID)
         else
-            Snitch.SendAlert(string_format("%s used Rescue (target unknown)!", sourceName), MODULE_ID)
+            -- As with Life Grip: a Rescue that marked nobody usually means the
+            -- passenger refused it by wearing a Neural Silencer. Rescue is not
+            -- documented as blocked by the aura, so the wording stays at
+            -- "attempted"; /tattle probe lists the wearers if you want to
+            -- confirm the behaviour on your build.
+            local blocked = Tattle.BlockedBySilencer(sourceName, "Rescue", nil, unitToken)
+            if blocked then
+                Tattle.SendAlert(blocked, MODULE_ID)
+                Tattle.DebugPrint("Rescue blocked:", sourceName)
+                return
+            end
+            Tattle.SendAlert(string_format("%s used Rescue (target unknown)!", sourceName), MODULE_ID)
         end
-        Snitch.DebugPrint("Rescue SUCCESS OOC:", sourceName, Snitch.TargetPhrase(passengers))
+        Tattle.DebugPrint("Rescue SUCCESS OOC:", sourceName, Tattle.TargetPhrase(passengers))
 
     elseif event == "UNIT_SPELLCAST_FAILED" then
         if not activeCasts[unitToken] then return end
         activeCasts[unitToken] = nil
-        Snitch.SendAlert(string_format("%s's Rescue failed.", sourceName), MODULE_ID)
-        Snitch.DebugPrint("Rescue FAILED OOC:", sourceName)
+        -- Stating who is immune, not blaming them: a Rescue can fail for plenty
+        -- of other reasons.
+        Tattle.SendAlert(string_format("%s's Rescue failed.%s",
+            sourceName, Tattle.SilencerNote(unitToken)), MODULE_ID)
+        Tattle.DebugPrint("Rescue FAILED OOC:", sourceName)
 
     elseif event == "UNIT_SPELLCAST_INTERRUPTED" then
         if not activeCasts[unitToken] then return end
         activeCasts[unitToken] = nil
-        Snitch.SendAlert(string_format("%s's Rescue was interrupted.", sourceName), MODULE_ID)
-        Snitch.DebugPrint("Rescue INTERRUPTED OOC:", sourceName)
+        Tattle.SendAlert(string_format("%s's Rescue was interrupted.", sourceName), MODULE_ID)
+        Tattle.DebugPrint("Rescue INTERRUPTED OOC:", sourceName)
     end
 end
 
@@ -129,19 +154,21 @@ end
 -- ============================================================================
 
 local function Initialize()
-    Snitch.DebugPrint("Rescue module initialized")
+    Tattle.DebugPrint("Rescue module initialized")
     for _, id in ipairs(GetWatchedSpellIDs()) do
         local info = C_Spell.GetSpellInfo(id)
         if info and info.name then
             rescueNames[info.name] = true
-            Snitch.DebugPrint("  Watching:", info.name, "(" .. id .. ")")
+            Tattle.DebugPrint("  Watching:", info.name, "(" .. id .. ")")
         else
-            Snitch.DebugPrint("  WARNING: spell ID", id, "not found — may need updating")
+            Tattle.DebugPrint("  WARNING: spell ID", id, "not found — may need updating")
         end
     end
+
+    Tattle.WatchSpellNames(rescueNames)
 end
 
-Snitch:RegisterModule(MODULE_ID, {
+Tattle:RegisterModule(MODULE_ID, {
     name        = MODULE_NAME,
     tabName     = "Rescue",        -- short: six tabs have to fit one row
     description = MODULE_DESCRIPTION,
