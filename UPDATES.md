@@ -1,5 +1,18 @@
 # Recent Updates
 
+### Renamed: Snitch -> Tattle
+**Before**: the addon, its folder, its chat command (`/snitch`), its global and its
+saved variables (`SnitchDB`) were all called Snitch
+
+**Now**: Tattle - `Tattle.toc`, `/tattle`, `Tattle`, `TattleDB`, `TattleConfigPanel`.
+`/tattle` is the only command; the old spelling is not registered, so a stale
+keybind fails visibly rather than working behind an alias the docs do not teach
+
+**Gotcha**: saved variables are stored per addon folder and one addon cannot read
+another's file, so configuration starts fresh. To keep yours, copy
+`WTF/Account/<account>/SavedVariables/Snitch.lua` over `Tattle.lua` and rename the
+top-level variable inside it
+
 ## Major Changes
 
 ### Per-Module Alert Configuration 
@@ -8,12 +21,12 @@
 **Now**: Each module has its own independent alert configuration!
 
 **Benefits**:
-- SwapBlaster can use screen + audio alerts
+- Swapblaster can use screen + audio alerts
 - Life Grip can use console output only
 - Each module fully customizable
 
 **How It Works**:
-1. Global master switch (`/snitch` → "Enable Snitch") - turns entire addon on/off
+1. Global master switch (`/tattle` → "Enable Tattle") - turns entire addon on/off
 2. Per-module enable/disable (module checkbox)
 3. Per-module alert settings (click "Configure..." button)
 
@@ -32,10 +45,10 @@ Detects when a priest uses Life Grip (Leap of Faith) **while out of combat**.
 
 ### Main Config Panel
 ```
-/snitch
+/tattle
 ├── Global Enable/Disable (master switch)
 └── Modules:
-    ├── [x] SwapBlaster Detector [Configure...]
+    ├── [x] Swapblaster Detector [Configure...]
     └── [x] Life Grip Detector [Configure...]
 ```
 
@@ -70,7 +83,7 @@ Accessed from any module's config:
 
 **Before**:
 ```lua
-SnitchDB = {
+TattleDB = {
   enabled = true,
   alerts = {  -- Global alerts
     console = true,
@@ -87,7 +100,7 @@ SnitchDB = {
 
 **After**:
 ```lua
-SnitchDB = {
+TattleDB = {
   enabled = true,  -- Global master switch
   modules = {
     swapblaster = {
@@ -120,16 +133,16 @@ SnitchDB = {
 
 ## Command Changes
 
-### `/snitch status` Output
+### `/tattle status` Output
 
 **Before**:
 ```
-Snitch Status:
+Tattle Status:
   Enabled: ON
   Version: 0.1.0
   ...
 Modules:
-  [SwapBlaster Detector] ON
+  [Swapblaster Detector] ON
 Alerts:
   Console: ON
   Chat: OFF
@@ -138,12 +151,12 @@ Alerts:
 
 **After**:
 ```
-Snitch Status:
+Tattle Status:
   Global Enabled: ON
   Version: 0.1.0
   ...
 Modules:
-  [SwapBlaster Detector] ON
+  [Swapblaster Detector] ON
     Alerts: Console=ON, Chat=OFF (PARTY), Audio=OFF, Screen=ON
   [Life Grip Detector] ON
     Alerts: Console=ON, Chat=OFF (PARTY), Audio=OFF, Screen=OFF
@@ -164,14 +177,14 @@ Modules:
 ## Testing Checklist
 
 1. **Existing Settings**:
-   - [ ] Load addon with existing SnitchDB
+   - [ ] Load addon with existing TattleDB
    - [ ] Verify modules still enabled/disabled correctly
    - [ ] Open config, verify per-module settings initialized
 
-2. **SwapBlaster Module**:
-   - [ ] Open SwapBlaster config
+2. **Swapblaster Module**:
+   - [ ] Open Swapblaster config
    - [ ] Enable screen + audio
-   - [ ] Trigger SwapBlaster alert
+   - [ ] Trigger Swapblaster alert
    - [ ] Verify both screen and audio work
 
 3. **Life Grip Module**:
@@ -199,7 +212,7 @@ Modules:
 ### Modified:
 - `Core.lua` - Updated to support per-module alerts
 - `Config.lua` - Complete UI redesign for per-module config
-- `Snitch.toc` - Added Life Grip module
+- `Tattle.toc` - Added Life Grip module
 
 ### Added:
 - `Modules/LifeGrip.lua` - New Life Grip detection module
@@ -207,7 +220,7 @@ Modules:
 
 ### Unchanged:
 - `ScreenAlert.lua` - No changes needed
-- `Modules/SwapBlaster.lua` - No changes needed (works with new system)
+- `Modules/Swapblaster.lua` - No changes needed (works with new system)
 
 ## Spell IDs
 
@@ -216,11 +229,11 @@ Verified against the live 12.1.5 spell database, so the checking this file used 
 | Ability | Verified ID | What the guess got wrong |
 | --- | --- | --- |
 | Life Grip | `73325` | Correct. Still named "Leap of Faith" in 12.x, instant, 40 yd |
-| SwapBlaster | `161399` | `470116` was wrong: it is an internal test spell ("Chasting Strike"). The cast is a spell named **"Swap"**, 1.5 sec channeled |
+| Swapblaster | `161399` | `470116` was wrong: it is an internal test spell ("Chasting Strike"). The cast is a spell named **"Swap"**, 1.5 sec channeled |
 | Neural Silencer | `156779`, `384129` | `470344` was wrong (a hidden test aura, "Supercharged"), and the buff is **Neural** Silencer |
 | Rescue | `370666`, `370667` | New module; `370667` is the passenger-side aura and is a strong candidate rather than a confirmed link |
 
-`/snitch probe` confirms what your own client exposes. Overrides go in the module tab's spell ID editor, not in code.
+`/tattle probe` confirms what your own client exposes. Overrides go in the module tab's spell ID editor, not in code.
 
 ## Summary
 
@@ -228,7 +241,7 @@ Verified against the live 12.1.5 spell database, so the checking this file used 
 - Life Grip detection module added
 - Configuration UI redesigned
 - Data structure updated
-- `/snitch status` enhanced
+- `/tattle status` enhanced
 - Backward compatible
 - Documentation updated
 

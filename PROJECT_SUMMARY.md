@@ -1,14 +1,14 @@
-# Snitch Addon - Project Summary
+# Tattle Addon - Project Summary
 
 ## Overview
 
-I've created a modular World of Warcraft addon called "Snitch" that alerts when group members perform certain actions. The initial implementation includes SwapBlaster toy detection, with an architecture designed to easily add more detection modules.
+I've created a modular World of Warcraft addon called "Tattle" that alerts when group members perform certain actions. The initial implementation includes Swapblaster toy detection, with an architecture designed to easily add more detection modules.
 
 ## What Was Built
 
 ### Core Files
 
-1. **Snitch.toc** - Addon descriptor
+1. **Tattle.toc** - Addon descriptor
    - Defines addon metadata
    - Lists all Lua files to load
    - Declares SavedVariables for settings persistence
@@ -29,8 +29,8 @@ I've created a modular World of Warcraft addon called "Snitch" that alerts when 
    - Audio testing
    - Integration with WoW settings panel
 
-4. **Modules/SwapBlaster.lua** - First detection module
-   - Detects SwapBlaster toy usage via combat log
+4. **Modules/Swapblaster.lua** - First detection module
+   - Detects Swapblaster toy usage via combat log
    - Tracks cast start, success, and cancellation
    - Attempts to identify target
    - Performance optimizations (name caching, localized globals)
@@ -63,7 +63,7 @@ Modular architecture allows easy addition of new detection modules:
 
 ### Configuration
 
-Full configuration UI accessible via `/snitch`:
+Full configuration UI accessible via `/tattle`:
 - Global enable/disable
 - Per-module enable/disable
 - Alert method preferences
@@ -72,11 +72,11 @@ Full configuration UI accessible via `/snitch`:
 ### Commands
 
 ```
-/snitch          - Open config
-/snitch version  - Show version
-/snitch on/off   - Enable/disable
-/snitch debug    - Toggle debug mode
-/snitch status   - Detailed status
+/tattle          - Open config
+/tattle version  - Show version
+/tattle on/off   - Enable/disable
+/tattle debug    - Toggle debug mode
+/tattle status   - Detailed status
 ```
 
 ## WoW Addon Best Practices Applied
@@ -118,26 +118,34 @@ Full configuration UI accessible via `/snitch`:
 ### Module Registration
 
 ```lua
-Snitch:RegisterModule("moduleId", {
-    name = "Display Name",
+Tattle:RegisterModule("moduleId", {
+    name        = "Display Name",
     description = "What it does",
-    onCombatLogEvent = function(...) end,  -- Combat log handler
-    onEvent = function(...) end,            -- Other event handler
-    initialize = function() end              -- Setup function
+    onEvent     = function(event, unitToken, castGUID, spellID) end,
+    initialize  = function() end,          -- resolve spell IDs to names here
+    events      = { "UNIT_SPELLCAST_SUCCEEDED" },  -- registered for you
+    spellIDs    = { 123456 },              -- feeds the tab's spell ID editor
+
+    -- Optional flags the core honours:
+    outOfCombatOnly = true,  -- skip cast starts while the caster is fighting
+    noScope         = true,  -- this module filters no casts; tab omits Monitor
+    extraContent    = function(container, moduleId, moduleSettings, y) return y end,
 })
 ```
+
+There is no `onCombatLogEvent` any more: `COMBAT_LOG_EVENT_UNFILTERED` was removed in 12.0.0.
 
 ### Alert Flow
 
 1. Module detects condition in event handler
-2. Calls `Snitch.SendAlert(message, moduleId)`
+2. Calls `Tattle.SendAlert(message, moduleId)`
 3. Core validates (enabled, in group, module enabled)
 4. Sends to all configured alert methods
 5. Error handling ensures partial failures don't break alerts
 
 ### Settings Persistence
 
-- Saved to `SnitchDB` SavedVariable
+- Saved to `TattleDB` SavedVariable
 - Automatically persists across sessions
 - Per-module settings for flexibility
 - Global alert preferences
@@ -154,13 +162,21 @@ If a patch changes one, override it in the module tab's spell ID editor rather t
 
 - Only works when in a party or raid group (by design: these abilities require a group)
 - `COMBAT_LOG_EVENT_UNFILTERED` was removed in 12.0.0, so detection runs entirely off `UNIT_SPELLCAST_*` events
-- Inside restricted content the spell ID is a secret value: it cannot be compared, printed or used as a key, so spells are matched by the name `C_Spell.GetSpellInfo` returns
+- Inside restricted content the spell ID is a secret value: it cannot be compared, printed or used as a key, so spells are matched by name. The core resolves that name once per cast event (`C_Spell.GetSpellName`, falling back to `C_Spell.GetSpellInfo`) and hands it to the modules that registered it
+
+### Neural Silencer (fourth module)
+
+`Modules/Silencer.lua` owns the aura that blocks the other three. It resolves the aura names from the (user-editable) spell IDs into `Tattle.silencerNames`, which every module reads, and answers two questions for them: is this player protected, and who in the group is? It announces nothing on its own - wearing the thing is not an event, and joining must not produce a roll call of who is protected - so a wearer only surfaces in the display, or inside a cast alert raised by the module that saw the attempt. It can display a small drag-positioned on-screen list of the group's protected members plus whoever currently has you targeted. Its tab uses the shared alert controls plus `extraContent` for the display options, and `noScope` because it filters no casts.
+
+### Chat channels
+
+`Tattle.ResolveChatChannel` maps a configured `Raid` / `Party` request onto the channel that group actually has. An LFR raid is a raid but not a `LE_GROUP_TYPE_RAID` one, and a plain `RAID` send there disappears without an error, so it becomes `INSTANCE_CHAT`; a `Raid` request while only in a party becomes `PARTY`.
 
 ### Target Detection
 
 Target detection depends entirely on whether the spell marks its victim:
 - Life Grip (4 s "Leap of Faith" aura) and Rescue (3 s "Rescue" aura) are attributed by name, because 12.1.0 made group auras readable out of combat again
-- SwapBlaster marks nobody, so its alerts report the caster only
+- Swapblaster marks nobody, so its alerts report the caster only
 - Rescue is instant and Leap of Faith is instant, so no cast-start event precedes them; the completion event must stand alone
 
 ## Adding New Modules
@@ -168,7 +184,7 @@ Target detection depends entirely on whether the spell marks its victim:
 To add a new detection module (e.g., hunter pet detection):
 
 1. Create `Modules/YourModule.lua`
-2. Follow the Rescue.lua pattern:
+2. Follow the Rescue.lua pattern (or Modules/Silencer.lua for a module that watches auras rather than casts):
    ```lua
    local MODULE_ID   = "yourmodule"
    local MODULE_NAME = "Your Module Name"
@@ -177,16 +193,23 @@ To add a new detection module (e.g., hunter pet detection):
    -- over secret spell IDs that can only be matched by name.
    local watchedNames = {}
 
-   local function OnEvent(event, unitToken, castGUID, spellID)
-       local info = C_Spell.GetSpellInfo(spellID)
-       if not info or not watchedNames[info.name] then return end
-       if not Snitch.IsGroupMemberToken(unitToken) then return end
-       if Snitch.ShouldReport(MODULE_ID, unitToken) == false then return end
+   -- The core resolves the spell name once per event and only wakes modules that
+   -- registered the name (Tattle.WatchSpellNames, called from Initialize). Take
+   -- the fifth argument; only a caller without a resolved name needs the API.
+   local function OnEvent(event, unitToken, castGUID, spellID, spellName)
+       if not Tattle.IsGroupMemberToken(unitToken) then return end
+       if spellName then
+           if not watchedNames[spellName] then return end
+       else
+           local name = Tattle.ResolveSpellName(spellID)
+           if not name or not watchedNames[name] then return end
+       end
+       if Tattle.ShouldReport(MODULE_ID, unitToken) == false then return end
 
-       Snitch.SendAlert("Message", MODULE_ID)
+       Tattle.SendAlert("Message", MODULE_ID)
    end
 
-   Snitch:RegisterModule(MODULE_ID, {
+   Tattle:RegisterModule(MODULE_ID, {
        name        = MODULE_NAME,
        description = "What it detects",
        onEvent     = OnEvent,
@@ -195,7 +218,7 @@ To add a new detection module (e.g., hunter pet detection):
        events      = { "UNIT_SPELLCAST_SUCCEEDED" },
    })
    ```
-3. Add to `Snitch.toc`
+3. Add to `Tattle.toc`
 4. `/reload` and test
 
 ## Next Steps
@@ -203,7 +226,7 @@ To add a new detection module (e.g., hunter pet detection):
 ### Testing
 
 1. Install addon in WoW (see TESTING.md)
-2. Find correct SwapBlaster spell ID
+2. Find correct Swapblaster spell ID
 3. Test in group environment
 4. Verify all alert methods work
 5. Test enable/disable functionality
@@ -229,12 +252,19 @@ Potential improvements:
 ## File Structure
 
 ```
-snitch/
-├── Snitch.toc              # Addon descriptor
+tattle/
+├── Tattle.toc              # Addon descriptor
+├── EventListener.lua       # Creates the event frame (loads first)
 ├── Core.lua                # Main addon logic
+├── ScreenAlert.lua         # Custom screen alerts
 ├── Config.lua              # Configuration UI
 ├── Modules/
-│   └── SwapBlaster.lua     # SwapBlaster detection
+│   ├── Swapblaster.lua     # Swapblaster detection
+│   ├── LifeGrip.lua        # Life Grip (Leap of Faith) detection
+│   ├── Rescue.lua          # Rescue detection
+│   └── Silencer.lua        # Neural Silencer scan, alerts and watch list
+├── Tests/
+│   └── wow_stub.lua        # Stub client harness (CI and local)
 ├── README.md               # User documentation
 ├── CHANGELOG.md            # Version history
 ├── TESTING.md              # Testing guide
@@ -264,4 +294,4 @@ snitch/
 
 ## Summary
 
-The Snitch addon is production-ready for initial testing with a solid foundation for expansion. The modular architecture makes adding new detection modules straightforward, while the comprehensive alert system provides flexibility in how notifications are delivered. Performance optimizations and error handling ensure the addon runs efficiently without impacting gameplay.
+The Tattle addon is production-ready for initial testing with a solid foundation for expansion. The modular architecture makes adding new detection modules straightforward, while the comprehensive alert system provides flexibility in how notifications are delivered. Performance optimizations and error handling ensure the addon runs efficiently without impacting gameplay.
