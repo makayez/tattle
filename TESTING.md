@@ -171,6 +171,7 @@ Configure different alert methods and verify each works:
 - [ ] Test with invalid spell ID (should not crash)
 - [ ] Test with nil values (addon should handle gracefully)
 - [ ] Check for any Lua errors in the default UI error window
+- [ ] `/tattle status` after a run: anything the addon swallowed is listed there, with a count ("Problems this session")
 
 ## Debug Mode
 
@@ -188,7 +189,14 @@ Debug output shows:
 
 ## Automated Harness
 
-`lua5.1 Tests/wow_stub.lua` (exit 0 = pass) loads the addon in TOC order against a stub client and asserts the behaviour that has broken before: alert routing, instant casts, channeled casts, scope gating, chat channel resolution (including LFR), the combat gate, the Neural Silencer call-outs, the watch list, the config tabs and the spell ID editor. The checks are numbered in a comment block near the top of the file. Widget keys the stub does not model are printed at the end as a "proxied" audit - a new key there is usually a typo, not a missing stub.
+`lua5.1 Tests/wow_stub.lua` (exit 0 = pass) loads the addon in TOC order against a stub client and asserts the behaviour that has broken before: alert routing, instant casts, channeled casts, scope gating, chat channel resolution (including LFR), the combat gates, the Neural Silencer call-outs, the watch list, the config tabs and the spell ID editor. The checks are numbered in a comment block near the top of the file.
+
+Since 0.2.0-beta.1 it also asserts the two things that went wrong in the alphas:
+
+- **One cast, one alert.** The two event halves of a swap - including the plain half and the channeled half arriving with *different* cast GUIDs - and the same cast reported once as your `raidN` index and once as `player`, must each produce one alert. And neither a record that never terminated nor a settled tombstone may mute that caster's next cast.
+- **Restricted content.** With the spell ID, the cast GUID and the caster token all modelled as secret values, a swap is still announced, is never given a name the client refused to give, and touches nothing the client forbids (the stub counts every refusal it was asked to make). On a stub build with no `C_SecretComparisons`, the refusal to classify a cast is announced once and counted, rather than answered as "not a cast we watch".
+
+Five audits run alongside the checks. Two are about the stub (widget keys it does not model are printed at the end - a new one is usually a typo - and a widget setter handed `nil` where the client demands a number is a failure). Three are about the source: nothing that came from the client may be compared with an empty string (the line that crashed alpha.3, which a Lua 5.1 harness cannot make to raise, so it is caught in the text instead), no module reaches past the core's accessors for a client value, and every module asks for an `outOfCombat` policy the core actually implements. A scenario that rewinds the stub clock is refused and reported too: a client's clock does not run backwards, and rewinding it makes a module's stale record look fresh.
 
 ## Known Limitations
 
@@ -196,9 +204,11 @@ Debug output shows:
 2. **Aura-dependent attribution**: Life Grip and Rescue can only be attributed while group auras are readable. 12.1.0 relaxed this out of combat; inside instances it can still be refused
 3. **Group Only**: alerts only work when in a party or raid group, which is also the only way these abilities can be used
 4. **In-combat use is ignored** for Life Grip and Rescue, where pulling someone is a legitimate save
-5. **Secret spell IDs**: inside restricted content the ID cannot be compared directly, so a spell whose *name* changes would need its ID re-entered
+5. **Restricted content**: inside M+ and rated PvP the spell ID, the cast GUID and the caster token all arrive as secret values that cannot be printed, concatenated, indexed or compared against a literal. Tattle identifies a cast by its name, through the client's own comparison API where the build has one. Where it does not, Tattle says that it was not allowed to classify the cast rather than reporting nothing
 6. **Other players' targets are not guaranteed**: "Targeting you" reads `<member>target` tokens, which a client may not be told about. An empty list means "none we can read", never "nobody is looking at you"
 7. **A blocked grab has to be inferred**: when a swap, grip or rescue is refused there is no victim aura to read, so the named victim is the group's only protected member. With more than one, the alert refuses to guess
+8. **Two of the same cast inside eight seconds read as one**: a cast is deduplicated by the record it left, not by the identity the client attached to the event - the plain half and the channeled half of one swap carry different GUIDs, and a restricted client will not compare them. Eight seconds is well inside this toy's cooldown, so the only way to be caught by this is to fire the same spell twice in a row deliberately, and the cost is one alert too few for something already announced
+9. **A caster the client will not name is called "someone"**: an alert never prints a name this client would not have printed itself
 
 ## Troubleshooting
 
@@ -213,9 +223,20 @@ Debug output shows:
 2. Enable debug mode: `/tattle debug`
    - Watch for messages explaining why alerts are blocked
 
-3. Verify spell IDs:
+3. Look at what the addon was told to keep quiet about:
+   - `/tattle status` prints "Problems this session" with a count for each kind
+   - A module that threw on a cast event, and a cast the client would not let Tattle
+     classify, both land there. The first of each kind is printed in chat when it
+     happens; the count is how you notice it afterwards
+   - In M+ and rated PvP the client hands cast events as secret values. If this build
+     has no `C_SecretComparisons`, Tattle cannot tell you whether a cast was one it
+     watches, and it says so rather than going quiet
+
+4. Verify spell IDs:
    - `/tattle probe`, then use the ability
    - Compare the spell name the probe prints against the module's expected name
+   - In restricted content the probe prints `table (fields not readable)` instead of a
+     name, because the client would not print one either
    - Enter the correct ID in that module's spell ID editor and `/reload`
 
 ### Configuration not saving

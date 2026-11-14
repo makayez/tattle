@@ -113,6 +113,13 @@ Registration also accepts three flags the core honours:
 
 `allCasters` is the fourth, and you probably do not want it: it opts the module out of the core's group-member filter, so casts by pets, minions and NPCs reach it too.
 
+What the core guarantees about the *values* it hands over, because 12.x hands some of them to you in a form you are not allowed to look at:
+
+- `unitToken` is a group slot Tattle resolved itself (`player`, `partyN`, `raidN`) wherever it could, so the same player cannot reach a module under two tokens and a module's per-cast state can be keyed on it. When the client will not identify the caster - a group member it hands over as a secret value, or somebody outside your group - the token arrives unchanged and may be a value that cannot be printed or compared: which is why names come from `Tattle.GetUnitShortName` / `Tattle.CasterLabel` and never from the token itself
+- spell identity is a name, matched by the core. Comparing a client-supplied name, GUID or unit token with a literal is what crashed alpha.3 inside restricted content - a secret string reports as a string and then refuses to be compared - so modules go through `Tattle.NameMatches`, `Tattle.ResolveSpellName`, `Tattle.GetUnitShortName` and `Tattle.CasterLabel` instead of `UnitName`, `UnitDisplayName` or `C_Spell.GetSpellName`. The harness audits for exactly that
+- a cast the client would not let Tattle classify is not passed to modules as "not our spell". It is dropped, said once in chat, and counted in `/tattle status`
+- anything the core had to swallow - a module that threw, a refusal it could not resolve - is counted in `Tattle.ReportProblem` and listed by `/tattle status`, so a silent run is not an undiagnosable one
+
 ### Creating a New Module
 
 To add a new detection module:
