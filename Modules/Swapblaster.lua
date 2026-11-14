@@ -56,12 +56,25 @@ local isSwap, isBackfire
 -- never reaches a table key.
 local activeCasts = {}
 
--- How long a record keeps describing the cast it was made for, whether that cast
--- has settled or not. The events for one cast arrive within a second or two of
--- each other; anything later than this from the same unit belongs to a different
--- cast, and must not be silenced by - or described by - what the first one left
--- behind.
+-- How long a record may still claim to describe the cast it was made for, whether
+-- that cast has settled or not. This is the backstop, not the primary rule: the
+-- events for one cast arrive within a second or two of each other, and anything
+-- later than this from the same unit belongs to a different cast and must not be
+-- silenced by - or described by - what the first one left behind.
+--
+-- The primary rule is which event family a start arrived as (see BelongsToRecord),
+-- because two halves of one cast and two attempts at a swap can be the same number
+-- of seconds apart, and time cannot tell them apart.
 local RESOLVED_TTL = 8
+
+-- The two families a cast can start with. One cast has at most one start of each:
+-- a plain one and a channeled one, which is why the family of a start event says
+-- something about whether it can be a cast this record already describes.
+local FAMILY_PLAIN, FAMILY_CHANNEL = "plain", "channel"
+
+local function FamilyOf(channelled)
+    return channelled and FAMILY_CHANNEL or FAMILY_PLAIN
+end
 
 -- A record whose cast is over. Two kinds of permanent mute were possible here:
 -- the settled record outliving its usefulness (which alpha.3 fixed), and the
@@ -142,16 +155,51 @@ end
 -- GUIDs - which is as well as it is, since a restricted client hands the GUID as a
 -- secret value and will not say whether two of them match.
 --
--- So the rule is the window a record covers. Two halves of one cast are a second or
--- two apart; two swaps are a cooldown apart, and nobody fires this toy twice inside
--- eight seconds. A start event that arrives while a fresh record exists belongs to
--- the cast that record describes, whatever identity it carries. The safe side of that
--- is one alert too few for something already announced, rather than what a player
--- actually reported: "Malloc is casting Swapblaster" and "Malloc's Swapblaster was
--- interupted", each of them twice, for one swap.
+-- So the rule is the record and the event family, and the window is only the
+-- backstop: two halves of one cast are a second or two apart, so a record stops
+-- describing a cast after eight seconds no matter what. What a start event decides
+-- is in BelongsToRecord below - and what it must not decide is that a second attempt
+-- is a duplicate, which is what "suppress any start while a fresh record exists"
+-- meant in practice: the duplicate a player reported (the same swap announced twice)
+-- and the second swap they never heard about at all, from the same branch.
+
+-- Does this start event belong to the cast `cast` already describes?
+--
+-- Time cannot answer that - two halves of one cast and two attempts at a swap can
+-- both be two seconds apart - but the event family can, because one cast sends at
+-- most one start of each family:
+--
+--   * a start of the *other* family is the second half of the recorded cast, and it
+--     can arrive after that cast already settled: CHANNEL_START, INTERRUPTED, and
+--     only then the plain START the channeled-spell hack also sends;
+--   * a start of the *same* family with no outcome yet is one cast the client
+--     reported twice - which is what a raid client does with your own casts, once
+--     under your raidN index and once as player;
+--   * a start of the *same* family after the record settled is the one shape that
+--     cannot be this cast, and it is a second attempt: refused or out of range,
+--     retargeted, fired again. That one gets its own record and its own alerts.
+--
+-- The last clause is what this module got wrong in the other direction. Suppressing
+-- any start while a fresh record existed meant somebody who failed a Swapblaster and
+-- landed a real one two seconds later was reported not at all - both its alerts were
+-- swallowed by the first attempt's record, for as long as eight seconds. A missed
+-- alert is the failure a watchdog cannot be allowed: an alert too few for something
+-- already announced is, and the two are not the same trade.
+local function BelongsToRecord(cast, channelled)
+    -- A record this module built from a terminal event alone never saw a start, so
+    -- it cannot tell a late half from a new attempt by family. It claims the start,
+    -- which is the conservative choice and the old one: an out-of-order start is
+    -- likelier than a second attempt nobody announced.
+    if not cast.family then return true end
+    if cast.family ~= FamilyOf(channelled) then return true end
+    return not cast.resolved
+end
+
 local function ArmCast(unitToken, channelled)
     local existing = activeCasts[unitToken]
-    if existing and not IsStale(existing) then return nil end
+    if existing and not IsStale(existing) and BelongsToRecord(existing, channelled) then
+        return nil
+    end
 
     activeCasts[unitToken] = {
         -- Recorded now, on purpose: every alert this cast produces describes the
@@ -165,6 +213,7 @@ local function ArmCast(unitToken, channelled)
         victim    = Tattle.GroupMemberTargetOf(unitToken),
         startedAt = GetTime(),
         duration  = CastWindowSeconds(unitToken, channelled),
+        family    = FamilyOf(channelled),
         resolved  = false,
     }
     return activeCasts[unitToken]
@@ -175,7 +224,11 @@ end
 -- half. A cast with no record at all still gets claimed, so a swap your client
 -- only ever saw the end of - a start cast on somebody out of range, a start the
 -- client never sent - is not dropped.
-local function ClaimCast(unitToken)
+-- `family` says which half of the event families this terminal belongs to, so a
+-- record built here can answer BelongsToRecord for a start that arrives later: the
+-- client's CHANNEL_STOP is the channeled half and SUCCEEDED the plain one, while a
+-- FAILED or INTERRUPTED could be either and claims both.
+local function ClaimCast(unitToken, family)
     local cast = activeCasts[unitToken]
     if cast and not IsStale(cast) then
         if cast.resolved then return nil end
@@ -193,6 +246,7 @@ local function ClaimCast(unitToken)
         victim    = Tattle.GroupMemberTargetOf(unitToken),
         startedAt = GetTime(),
         duration  = nil,
+        family    = family,
         resolved  = true,
         resolvedAt = GetTime(),
     }
@@ -307,14 +361,14 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         Tattle.DebugPrint("Swapblaster START:", sourceName, note)
 
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
-        local claimed = ClaimCast(unitToken)
+        local claimed = ClaimCast(unitToken, FAMILY_PLAIN)
         if not claimed then return end
 
         Tattle.SendAlert(CompletionMessage(sourceName, unitToken, claimed), MODULE_ID)
         Tattle.DebugPrint("Swapblaster SUCCESS:", sourceName)
 
     elseif event == "UNIT_SPELLCAST_CHANNEL_STOP" then
-        local cast = ClaimCast(unitToken)
+        local cast = ClaimCast(unitToken, FAMILY_CHANNEL)
         if not cast then return end
 
         local finished = FinishedAsExpected(cast)

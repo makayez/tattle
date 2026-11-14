@@ -38,6 +38,11 @@ local function MakeGripModule(spec)
     -- that unit. Without an expiry, one FAILED cast that the client reported as a
     -- start and nothing else left the unit armed for the rest of the run, and any
     -- later INTERRUPTED - of a different cast entirely - was announced as this one.
+    -- Eight seconds, the same span Swapblaster uses as the backstop on a record: a
+    -- failure or interrupt belongs to the start this module watched for, and past
+    -- that span it belongs to a cast this module never saw begin. Neither spell is
+    -- channeled, so this module has no second start family to tell apart (see
+    -- BelongsToRecord in Modules/Swapblaster.lua) and the window alone is the rule.
     local ARM_TTL = 8
 
     local function IsArmed(unitToken)
@@ -123,7 +128,11 @@ local function MakeGripModule(spec)
                 sourceName, action, Tattle.SilencerNote(unitToken)), MODULE_ID)
             Tattle.DebugPrint(action, "FAILED:", sourceName)
 
-        else  -- UNIT_SPELLCAST_INTERRUPTED
+        elseif event == "UNIT_SPELLCAST_INTERRUPTED" then
+            -- Named rather than `else`: an else branch reading as "the remaining
+            -- registered event" is only true while the event list above is the whole
+            -- list, and a module that later registers a channel event would find its
+            -- CHANNEL_START reported as an interruption.
             if not IsArmed(unitToken) then return end
             armedCasts[unitToken] = nil
             Tattle.SendAlert(string_format("%s's %s was interrupted.", sourceName, action), MODULE_ID)

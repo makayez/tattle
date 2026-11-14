@@ -520,9 +520,20 @@ local function Initialize()
     -- out here, into the one shared set every module reads.
     for _, id in ipairs(Tattle.MakeSpellIDs(MODULE_ID, SILENCER_SPELL_IDS)) do
         local name = Tattle.ResolveSpellName(id)
-        if name then
-            Tattle.silencerNames[name] = true
-            Tattle.DebugPrint("  Neural Silencer:", name, "(" .. tostring(id) .. ")")
+        -- Through Tattle.PlainText, not `if name`. This is a name the client handed
+        -- over about to be used as a table key, and indexing or keying with a value a
+        -- restricted client keeps secret is an error rather than a miss. The core
+        -- guards exactly this in ResolveSpellNames; a module that reads a spell name
+        -- goes through the same guard whatever it means to do with the answer - which
+        -- is also why the debug line prints `plain` and not `name`.
+        local plain = Tattle.PlainText(name)
+        if plain then
+            Tattle.silencerNames[plain] = true
+            Tattle.DebugPrint("  Neural Silencer:", plain, "(" .. tostring(id) .. ")")
+        elseif type(name) ~= "nil" then
+            Tattle.ReportProblem(
+                "a Neural Silencer spell name could not be read from spell ID " .. tostring(id),
+                "the client returned a value this addon is not allowed to store")
         else
             Tattle.DebugPrint("  WARNING: Neural Silencer spell ID", id, "is not in this client's spell database")
         end

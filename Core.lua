@@ -130,7 +130,13 @@ local function SecretNameMatches(nameSet, secretName)
             if same then return true end
         end
     end
-    return answered and false or nil
+    -- `answered and false or nil` reads like the answer and is not: `true and
+    -- false` is false, and `false or nil` is nil, so the idiom makes "the client
+    -- said no" indistinguishable from "the client would not answer" -- which on a
+    -- restricted build turns every unwatched cast in the instance into a reported
+    -- refusal. Say it in two lines instead.
+    if answered then return false end
+    return nil
 end
 
 -- "Is this name in nameSet?" - true/false when answered, nil when the client
@@ -159,7 +165,10 @@ Tattle.NameMatches = NameMatches
 -- anyway, and an event in it but not registered here would be silently dead.
 -- GROUP_ROSTER_UPDATE is registered here rather than left to the modules
 -- because the core caches the group's unit tokens and has to drop them whether
--- or not any module wants them.
+-- or not any module wants them. The PLAYER_REGEN pair is registered for the same
+-- reason: whether *this player* is fighting decides whether the addon does
+-- anything at all (see "Idle while you fight" below), so the core has to know
+-- about the transition even when no module asked.
 
 -- The two events that *begin* a cast. The core's `outOfCombat = "start"` policy
 -- is judged against this set, so it has to name both families a cast can start
@@ -211,6 +220,9 @@ local OUT_OF_COMBAT_EVENTS = {
 Tattle.eventFrame = CreateFrame("Frame", nil, UIParent)
 Tattle.eventFrame:RegisterEvent("ADDON_LOADED")
 Tattle.eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+Tattle.eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+Tattle.eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+Tattle.eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 for event in pairs(CAST_EVENTS) do
     Tattle.eventFrame:RegisterEvent(event)
 end
@@ -401,6 +413,9 @@ end
 local sessionProblems = {}     -- kind -> { count = n, detail = "first one seen" }
 
 function Tattle.ReportProblem(kind, detail)
+    -- Always a string, because /tattle status prints it with %s and the client's
+    -- Lua 5.1 string.format raises on a nil where a newer one prints "nil".
+    if detail == nil then detail = "no detail" end
     local problem = sessionProblems[kind]
     if problem then
         problem.count = problem.count + 1
@@ -893,6 +908,49 @@ local function UnitInCombat(unitToken)
 end
 Tattle.UnitInCombat = UnitInCombat
 
+-- ---------------------------------------------------------------------------
+-- Idle while you fight
+-- ---------------------------------------------------------------------------
+--
+-- Everything Tattle watches is an out-of-combat act: the Swapblaster cannot be
+-- used in combat at all, and the alerts exist to tell a group that somebody is
+-- griefing them in a city, a mining node or a resting pull. So while *you* are
+-- fighting the addon does nothing: no module is woken, no alert is sent, no
+-- problem is reported. What it does not do is decide on your behalf that a fight
+-- you are in is uninteresting one cast at a time.
+--
+-- This is a separate rule from a module's `outOfCombat` policy, which asks about
+-- the *caster*: you can be standing still while a group member is fighting, and a
+-- caster who is fighting cannot be griefing anybody.
+--
+-- One consequence worth stating, because it is a behaviour the modules used to keep
+-- deliberately: a swap that *began* out of combat and lands after this player is
+-- fighting is no longer announced. Swapblaster's `outOfCombat = "start"` policy exists
+-- precisely to keep that alert (landing a swap next to a pack is a way to start a fight,
+-- and the completion event can arrive after combat did). It still applies to the caster;
+-- this player's combat state now overrides it. The alternative is a per-cast latch - a
+-- cast accepted while out of combat keeps its alerts after the pull - which is a
+-- different reading of "nothing while in combat" than the one implemented here, and the
+-- trade is in the harness check "nothing is announced while you are fighting".
+--
+-- Kept as a cached flag updated by PLAYER_REGEN_DISABLED/ENABLED rather than
+-- asked per event: the dispatcher runs for every cast event the raid produces,
+-- and a boolean it already knows is cheaper than a client call it does not need.
+-- The flag has to be seeded, because those two events only fire on a transition -
+-- loading the UI already inside combat would otherwise leave it saying "not
+-- fighting" for the rest of the session.
+local iAmInCombat = nil      -- nil until first read: never guess in either direction
+
+local function RefreshOwnCombatState()
+    iAmInCombat = UnitInCombat("player")
+end
+
+local function IAmInCombat()
+    if iAmInCombat == nil then RefreshOwnCombatState() end
+    return iAmInCombat == true
+end
+Tattle.IAmInCombat = IAmInCombat
+
 -- Settings for a module (enabled, scope, alerts). nil-safe.
 function Tattle.GetModuleSettings(moduleId)
     return (TattleDB and TattleDB.modules and TattleDB.modules[moduleId]) or nil
@@ -1046,10 +1104,14 @@ function Tattle.ResolveSpellNames(nameSet, spellIDs)
         if plain then
             nameSet[plain] = true
             DebugPrint("  watching", plain, "(" .. tostring(id) .. ")")
-        elseif name then
+        elseif type(name) ~= "nil" then
             -- A name this addon cannot store as a key is a spell it cannot watch
             -- by name. Loud, because it means a shipped spell ID stopped being a
             -- plain value and every alert for it is dead.
+            --
+            -- `type()`, not `elseif name`: a value this addon is not allowed to read
+            -- may still be a value it is not allowed to test for truthiness, and a
+            -- report that raises while building its own message is a bad trade.
             Tattle.ReportProblem("a spell name could not be read from spell ID " .. tostring(id),
                 "the client returned a value this addon is not allowed to store")
         else
@@ -1179,6 +1241,15 @@ local function CallModule(module, moduleId, event, ...)
 end
 
 Tattle.eventFrame:SetScript("OnEvent", function(_, event, ...)
+    if event == "PLAYER_REGEN_DISABLED" or event == "PLAYER_REGEN_ENABLED"
+        or event == "PLAYER_ENTERING_WORLD" then
+        -- Before everything else, like the group caches: whether the addon is
+        -- allowed to act at all is not something a module gets to veto, and
+        -- PLAYER_ENTERING_WORLD is the re-read that catches a combat state carried
+        -- across a login, a /reload or a realm hop.
+        RefreshOwnCombatState()
+    end
+
     if event == "ADDON_LOADED" then
         local loadedName = ...
         if loadedName ~= ADDON_NAME then return end
@@ -1190,11 +1261,26 @@ Tattle.eventFrame:SetScript("OnEvent", function(_, event, ...)
         -- listeners, so pairs() cannot reshuffle either between sessions. No
         -- module reads another's initialize() output today -- that is luck, not
         -- design -- but TOC order is at least a defined order to have luck in.
+        -- Guarded like a module's event handler, and for the same reason plus one:
+        -- a module that throws here used to abort this loop, so every module after
+        -- it in TOC order, the listener lists, the config tabs and the load line
+        -- were all simply gone, with one taint line as the whole notice. An
+        -- uninitialised module is a dead feature; an aborted handler is the addon.
         for _, moduleId in ipairs(Tattle.moduleOrder) do
             InitializeModuleSettings(moduleId)
             local module = Tattle.modules[moduleId]
-            if module.initialize then module.initialize() end
+            if module.initialize then
+                local ok, err = pcall(module.initialize)
+                if not ok then
+                    Tattle.ReportProblem(string_format("module %s failed to initialize", moduleId), err)
+                end
+            end
         end
+
+        -- Combat state only announces transitions, so it has to be read once here:
+        -- a UI loaded (or reloaded) mid-fight would otherwise believe itself idle
+        -- until the fight ended and began again.
+        RefreshOwnCombatState()
 
         RebuildModuleListeners()
 
@@ -1216,6 +1302,7 @@ Tattle.eventFrame:SetScript("OnEvent", function(_, event, ...)
 
     if not addonReady then return end
     if not TattleDB or not TattleDB.enabled then return end
+    if IAmInCombat() then return end   -- you are fighting: this addon says nothing
     if not IsGrouped() then return end  -- grouped only, bail early
 
     -- Cast events are filtered here, once, before any module is woken.
@@ -1261,7 +1348,23 @@ Tattle.eventFrame:SetScript("OnEvent", function(_, event, ...)
         -- this addon's own tokens: it turns a secret caster into a printable, storable
         -- key, and folds the two tokens a raid client can report one cast under into
         -- a single identity for the modules' per-cast bookkeeping.
-        casterToken = GroupSlotOf(arg1) or arg1
+        --
+        -- A group member this addon cannot place is reported and dropped rather than
+        -- passed through as the client's own token. Modules key their per-cast state
+        -- on this value, so handing them an unresolved token means handing them a
+        -- value that may be secret -- and a secret value used as a table key raises.
+        -- The only module allowed to receive an unplaceable caster is one that opted
+        -- out of the group filter (`allCasters`), which is asking about pets, minions
+        -- and nameplates: those tokens are plain strings by construction, and there is
+        -- no group slot for them to resolve to in the first place.
+        local slot = GroupSlotOf(arg1)
+        if not slot and not eventAcceptsAnyCaster[event] then
+            Tattle.ReportProblem(
+                "a group member's cast could not be placed in the group",
+                "the client said this caster is one of ours and then would not say which one")
+            return
+        end
+        casterToken = slot or arg1
     end
     local dispatchToken = casterToken or arg1
 

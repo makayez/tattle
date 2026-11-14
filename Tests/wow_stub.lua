@@ -641,9 +641,25 @@ do
     end
 end
 
+-- The TOC's own version, not a copy of it typed into this file. A second string that
+-- has to be remembered is one that drifts: this said "0.2.0" while Tattle.toc said
+-- 0.2.0-alpha.3, which made a check about the version line uninteresting, and the
+-- version a player reads in /tattle status is the one this function feeds it.
+local function readTocVersion()
+    local handle = io.open(ADDON_DIR .. "/Tattle.toc", "r")
+    if not handle then return nil end
+    local version = nil
+    for line in handle:lines() do
+        version = line:match("^##%s*Version:%s*(.+)%s*$") or version
+    end
+    handle:close()
+    return version
+end
+local TOC_VERSION = readTocVersion()
+
 C_AddOns = {
     GetAddOnMetadata = function(_, key)
-        if key == "Version" then return "0.2.0" end
+        if key == "Version" then return TOC_VERSION end
         return nil
     end,
 }
@@ -745,6 +761,16 @@ local function findMultiLineEditBox(root)
     return findFrame(root, function(f)
         return f.kind == "EditBox" and f._multiLine
     end)
+end
+
+-- Same search, bounded to the lines printed after a mark in the log - which is what a
+-- check about "what the addon said just now" needs, and what an unbounded backwards
+-- search quietly is not.
+local function lastPrintFrom(mark, needle)
+    for i = #printLog, mark + 1, -1 do
+        if printLog[i]:find(needle, 1, true) then return printLog[i] end
+    end
+    return nil
 end
 
 local function lastPrintContaining(needle)
@@ -926,6 +952,15 @@ realPrint("== Checks ==")
 -- 22. the core's start gate is proven to *drop* as well as to allow. A policy that
 --     gated nothing is invisible to every other check in this file, and "start"
 --     gating nothing is exactly what alpha.3 shipped.
+-- 23. idle while you fight: while *this player* is fighting nothing is announced and
+--     nothing is asked of the client, the same cast alerts once PLAYER_REGEN_ENABLED
+--     fires, /tattle status says which state the addon believes it is in, the probe is
+--     the one thing that keeps reporting, and /tattle off disarms it.
+--
+-- A module that throws while initializing is also in here, registered deliberately
+-- before ADDON_LOADED: an unguarded initialize used to abort the handler after the
+-- registry was filled, which produced an addon that had registered its modules and
+-- then done nothing at all.
 --
 -- Five audits run alongside the checks. Two are about the stub: widget keys it does
 -- not model are printed at the end (a new one is usually a typo), and a widget
@@ -945,6 +980,52 @@ table.sort(leakedGlobals)
 check("the addon leaves no globals behind beyond its saved variables and its slash command",
     #leakedGlobals == 0, table.concat(leakedGlobals, ", "))
 
+-- Session problems, read the way /tattle status reads them. Needed here, at the first
+-- check that cares about them, and by the restricted-content checks a thousand lines on.
+local function countProblemOf(kind)
+    local problems = Tattle.SessionProblems()
+    local problem = problems[kind]
+    return problem and problem.count or 0
+end
+
+local function problemSummary()
+    local problems = Tattle.SessionProblems()
+    local kinds = {}
+    for kind in pairs(problems) do kinds[#kinds + 1] = kind end
+    table.sort(kinds)
+    local parts = {}
+    for _, kind in ipairs(kinds) do parts[#parts + 1] = kind .. " x" .. problems[kind].count end
+    return table.concat(parts, "; ") ~= "" and table.concat(parts, "; ") or "none"
+end
+
+local function countProblems()
+    local total = 0
+    for _, problem in pairs(Tattle.SessionProblems()) do total = total + problem.count end
+    return total
+end
+
+-- Two modules registered before ADDON_LOADED, which is the only way to exercise the
+-- module initialize loop from here: the late-registration path does not run initialize
+-- at all. The first one throws. Before the loop was guarded, a throw here aborted
+-- ADDON_LOADED after the module registry was filled but before the listener lists were
+-- built, the settings were applied and the config tabs existed - an addon that had
+-- registered three modules and then silently did nothing, noticed only as a taint line.
+-- The second module exists to answer the question the first one raises: did the loop
+-- carry on past it, or did everything after it in TOC order never initialize?
+local initializedAfterThrow = 0
+Tattle:RegisterModule("thrower", {
+    name = "Deliberately broken",
+    events = {},
+    initialize = function() error("this module refuses to initialize", 0) end,
+    onEvent = function() end,
+})
+Tattle:RegisterModule("survivor", {
+    name = "Registered after the thrower",
+    events = {},
+    initialize = function() initializedAfterThrow = initializedAfterThrow + 1 end,
+    onEvent = function() end,
+})
+
 local eventErrors = dispatch("ADDON_LOADED", "Tattle")
 runTimers()
 check("ADDON_LOADED completes without error", #eventErrors == 0, table.concat(eventErrors, "; "))
@@ -954,6 +1035,15 @@ check("load banner printed",
     "no load line (a Lua error in ADDON_LOADED aborts the rest of the handler)")
 check("Interface Options category registered",
     interfaceOptionsRegistered == 1, "got " .. interfaceOptionsRegistered)
+
+-- The three together are the whole claim: the failing module was reported rather than
+-- swallowed, the module behind it still got its initialize, and the rest of the handler
+-- ran. Any one of them alone is what a half-fixed version still passes.
+check("a module that throws while initializing is reported",
+    countProblemOf("module thrower failed to initialize") == 1,
+    "problems: " .. problemSummary())
+check("and it does not stop the module registered behind it from initializing",
+    initializedAfterThrow == 1, "initialize ran " .. initializedAfterThrow .. " time(s) for the survivor")
 
 check("modules registered in TOC order",
     Tattle.moduleOrder[1] == "swapblaster" and Tattle.moduleOrder[2] == "lifegrip"
@@ -1376,6 +1466,35 @@ dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid4", "guid-two-tokens", 161399)
 runTimers()
 check("and its interrupt, reported under both tokens again, is one alert",
     #sentMessages == 2, messageLog())
+
+-- The cost of the rule above, and the side of the trade that matters more. This toy has
+-- no cooldown worth speaking of, so "refused, retargeted, fired again" is two seconds
+-- apart and entirely ordinary - and suppressing every start while a fresh record exists
+-- meant the second swap produced no alerts at all, for the whole eight second window.
+-- What tells a second attempt from the late half of the first cast is which event family
+-- the start arrived as, not how many seconds have passed: one cast sends at most one
+-- plain start and one channeled start, so a second plain start after the cast already
+-- has an outcome cannot be that cast.
+--
+-- What it cannot tell apart, and does not pretend to: a second attempt whose first event
+-- happens to be of the *other* family is read as the late half of the first, and stays
+-- unannounced. Nothing in the event stream separates those two, and the choice made is
+-- to lose one alert rather than to announce a cast twice.
+fiveDeepRaid(5)
+table.wipe(sentMessages)
+setClock(5140)
+dispatch("UNIT_SPELLCAST_START", "raid3", "guid-second-attempt-1", 161399)
+setClock(5141)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid3", "guid-second-attempt-1", 161399)
+runTimers()
+local refusedFirst = #sentMessages
+setClock(5143)   -- two seconds later: a second, separate, real attempt
+dispatch("UNIT_SPELLCAST_START", "raid3", "guid-second-attempt-2", 161399)
+setClock(5144)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid3", "guid-second-attempt-2", 161399)
+runTimers()
+check("two separate swaps two seconds apart are announced as two swaps",
+    refusedFirst == 2 and #sentMessages == 4, messageLog())
 check("which is the start and then the interrupt, not the same message twice",
     sentMessages[1].message:find("is casting", 1, true) ~= nil
         and sentMessages[2].message:find("was interrupted", 1, true) ~= nil
@@ -1462,12 +1581,6 @@ restoreAlertSettings()
 -- claims a name the client refused to give, and the addon never touches a value
 -- the client forbids (the stub counts each refusal it was asked to make).
 
-local function countProblems()
-    local total = 0
-    for _, problem in pairs(Tattle.SessionProblems()) do total = total + problem.count end
-    return total
-end
-
 fiveDeepRaid(5)
 isolateAlerts("swapblaster")
 table.wipe(sentMessages)
@@ -1529,6 +1642,29 @@ check("and none of it needed a problem reported to work",
     countProblems() == problemsQuiet,
     "reported problems: " .. tostring(countProblems() - problemsQuiet))
 
+-- A secret spell that is *not* one Tattle watches - which in a Mythic+ key is most of
+-- what the raid is casting. "The client compared it and said no" and "the client would
+-- not compare it at all" are different answers, and the code that decided that used to
+-- compute them with `answered and false or nil`, an idiom that cannot produce `false`.
+-- Mistake the two and every other player's cooldown in the instance becomes a reported
+-- refusal, `/tattle status` fills with a single line repeated hundreds of times, and the
+-- one place that distinguishes a real restriction from ordinary casting stops being
+-- readable. So: no alert, and no problem either.
+fiveDeepRaid(5)
+table.wipe(sentMessages)
+local problemsBeforeUnwatched = countProblems()
+Secret.setContext(true)
+setClock(5840)
+local unwatchedSecret = dispatch("UNIT_SPELLCAST_CHANNEL_START",
+    Secret.asSecret("raid4"), Secret.asSecret("guid-unwatched"), Secret.asSecret(162217))
+Secret.setContext(false)
+runTimers()
+check("a secret cast of a spell Tattle does not watch is not announced",
+    #unwatchedSecret == 0 and #sentMessages == 0, messageLog())
+check("and it is not treated as a refusal either, because the client did answer",
+    countProblems() == problemsBeforeUnwatched,
+    "reported " .. (countProblems() - problemsBeforeUnwatched) .. " extra problem(s): " .. problemSummary())
+
 -- The client named the cast and then refused to say whether it was one of ours:
 -- a build with no secret-comparison API. Answering that "no" would silently drop
 -- every swap in the exact content the alerts are for, which is the failure the
@@ -1550,6 +1686,35 @@ check("and that refusal is told to you, once, in chat",
     lastPrintContaining("would not say whether a cast was one Tattle watches") ~= nil)
 check("and it is counted where /tattle status can reach it",
     countProblems() == beforeDenied + 1)
+-- Belt for the same command: whatever a module or the core decides to report, the line
+-- it reports has to be something /tattle status can print. The client's Lua 5.1
+-- string.format raises on a nil where a newer one prints "nil", so a report without a
+-- detail used to break the one command that exists to show reports - and only on the
+-- Lua that ships with the game, which is the kind of bug no local run ever sees.
+-- A report that arrived with no detail at all, which is what a module that just wants
+-- to say "something went wrong" writes. Reported here on purpose, before the loop below,
+-- so that loop is reading a real mixture rather than the only shape the core happens to
+-- report today.
+Tattle.ReportProblem("a problem reported with no detail, for the printer's sake")
+do
+    local unprintable = {}
+    for kind, problem in pairs(Tattle.SessionProblems()) do
+        if type(problem.detail) ~= "string" then
+            unprintable[#unprintable + 1] = kind .. " (detail is " .. type(problem.detail) .. ")"
+        end
+    end
+    check("every problem this session reported has something /tattle status can print",
+        #unprintable == 0, table.concat(unprintable, "; "))
+end
+do
+    -- And printing them all has to work. The client's Lua 5.1 string.format raises on a
+    -- nil where a newer one prints "nil", so this is the check that only fails in CI if
+    -- the two guards in Core.lua and Commands.lua both come back out.
+    local printedOK, printErr = callSlash("status")
+    check("so /tattle status prints every report, detail or none",
+        printedOK and lastPrintContaining("a problem reported with no detail") ~= nil,
+        tostring(printErr))
+end
 callSlash("status")
 check("so /tattle status names the problem and its count",
     lastPrintContaining("the client would not say whether a cast was one Tattle watches") ~= nil
@@ -1787,6 +1952,106 @@ dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-gate-open", 161399)
 runTimers()
 check("and lets the same cast through a moment later, once the caster is not fighting",
     #sentMessages == 1, messageLog())
+restoreAlertSettings()
+
+-- ============================================================================
+-- Idle while you fight
+-- ============================================================================
+
+-- Everything this addon watches is an out-of-combat act - the toy says "Cannot be used
+-- in combat" on its tooltip, and the alerts exist to tell a group that somebody is
+-- griefing them at a mining node or in a city. So while *this player* is fighting, the
+-- addon does nothing at all: no module woken, no alert sent, nothing asked of the
+-- client. That is a different question from the per-module gate above, which asks about
+-- the *caster*: you can be standing still while somebody else is fighting.
+--
+-- The state is a cached flag kept current by PLAYER_REGEN_DISABLED / _ENABLED and
+-- re-read on PLAYER_ENTERING_WORLD, so these checks have to move it the way a client
+-- would - by firing the transition - rather than only setting combat for "player".
+-- A check that only set combatUnits would be proving nothing, because the cached flag
+-- would still say "not fighting" and the addon would keep alerting for the wrong reason.
+muteAllModules()
+alertMode("swapblaster", "YELL")
+alertMode("lifegrip", "PARTY")
+resetWorld()
+fiveDeepRaid(5)
+table.wipe(sentMessages)
+local lookupsBeforeFight = spellNameLookups
+setCombatUnits("player")
+dispatch("PLAYER_REGEN_DISABLED")
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-me-fighting", 161399)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-me-fighting-grip", 73325)
+runTimers()
+check("nothing is announced while you are fighting, whichever module would have spoken",
+    #sentMessages == 0, messageLog())
+check("and nothing was asked of the client to decide that",
+    spellNameLookups == lookupsBeforeFight,
+    "spell names resolved: " .. (spellNameLookups - lookupsBeforeFight))
+check("the core knows it is holding quiet, which is what /tattle status reads",
+    Tattle.IAmInCombat() == true, "IAmInCombat answered " .. tostring(Tattle.IAmInCombat()))
+
+callSlash("status")
+check("so /tattle status says the addon is silent because you are fighting",
+    lastPrintContaining("silent while you fight") ~= nil,
+    "no in-combat line in /tattle status")
+
+-- And the gate opens. A rule that only ever closes is indistinguishable from a
+-- disconnect, and every positive-alert check in this file runs with you out of combat,
+-- so a gate stuck shut would be caught here rather than by the next hour of testing.
+setCombatUnits()
+dispatch("PLAYER_REGEN_ENABLED")
+table.wipe(sentMessages)
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-me-after-fight", 161399)
+runTimers()
+check("the same cast is announced once you are out of combat", #sentMessages == 1, messageLog())
+-- Read out of the status output printed *after* this call: lastPrintContaining searches
+-- the whole session, and the earlier status call in this same scenario said the opposite.
+local statusLines = #printLog
+callSlash("status")
+local claimsFighting = false
+for i = statusLines + 1, #printLog do
+    if printLog[i]:find("silent while you fight", 1, true) then claimsFighting = true end
+end
+check("and the status line stops claiming you are fighting",
+    not claimsFighting and lastPrintFrom(statusLines, "In combat:") ~= nil,
+    "stale in-combat state in /tattle status")
+
+-- The probe is the one thing the rule lets through, on purpose: the question it exists
+-- to answer is what a client sends and withholds *during* a fight. Pinned here because
+-- the next reasonable reader of this file will try to make it consistent with the rest
+-- of the addon, and the inconsistency is the point.
+local probeLinesBefore = #printLog
+callSlash("probe")
+setCombatUnits("player")
+dispatch("PLAYER_REGEN_DISABLED")
+table.wipe(sentMessages)
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-probe-in-fight", 161399)
+runTimers()
+check("while the addon is silent, the probe a player armed still reports",
+    #sentMessages == 0 and #printLog > probeLinesBefore
+        and lastPrintContaining("UNIT_SPELLCAST_CHANNEL_START") ~= nil,
+    "probe printed nothing while you were fighting")
+
+-- Left armed on purpose: it is the one component that rides its own frame rather than
+-- the module pipeline, so /tattle off would otherwise leave it printing a chat line for
+-- every watched cast after the player had asked for the addon to be off. The probe is
+-- still armed here, which is what makes the next check say something.
+setCombatUnits()
+dispatch("PLAYER_REGEN_ENABLED")
+callSlash("off")
+local linesAfterOff = #printLog
+table.wipe(sentMessages)
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-after-off", 161399)
+runTimers()
+check("turning the addon off disarms the probe with everything else",
+    #printLog == linesAfterOff, "the probe kept printing after /tattle off")
+callSlash("on")
+check("and the probe stays disarmed rather than coming back with the addon",
+    Tattle._probeFrame == nil, "probe frame still wired up")
 restoreAlertSettings()
 
 -- ============================================================================
@@ -2121,16 +2386,28 @@ check("panel has About + General + Screen Alerts + one tab per module",
     panel and panel.tabs and #panel.tabs == 3 + #Tattle.Config.moduleTabs,
     panel and panel.tabs and ("got " .. #panel.tabs))
 
+-- Tabs found by module rather than by position. These read "the last tab" and "tab 4",
+-- which was true only while exactly three modules existed in exactly this order - and
+-- this file now registers two throwaway modules of its own to test load-time failure,
+-- which took the last two tabs. A UI check that passes because of where a tab happens to
+-- sit is one added module away from testing nothing.
+local function moduleTabOf(moduleId)
+    if not (panel and panel.tabs) then return nil end
+    for i, tab in ipairs(Tattle.Config.moduleTabs or {}) do
+        if tab.moduleId == moduleId then return panel.tabs[3 + i] end
+    end
+end
+
 -- A module that watches auras rather than casts must not be handed a filter it
 -- ignores, but it does get its own section on the shared tab.
-local silencerTab = panel and panel.tabs and panel.tabs[3 + #Tattle.Config.moduleTabs]
+local silencerTab = moduleTabOf("silencer")
 check("the Silencers tab offers the watch list options",
     silencerTab and findCheckButton(silencerTab, "Show the watch list on screen") ~= nil
         and findCheckButton(silencerTab, "List group members targeting you (needs group target syncing)") ~= nil,
     "watch list controls missing")
 check("a module that filters no casts gets no Monitor control",
     silencerTab and not findLabel(silencerTab, "Monitor:")
-        and findLabel(panel.tabs[4], "Monitor:") ~= nil,
+        and findLabel(moduleTabOf("swapblaster"), "Monitor:") ~= nil,
     "Monitor dropdown present on the Silencers tab, or missing from Swapblaster's")
 
 local showListCheck = silencerTab and findCheckButton(silencerTab, "Show the watch list on screen")
@@ -2182,8 +2459,8 @@ if repositionBtn then
     resetWorld()
 end
 
--- Spell-ID editor on the first module tab (tabs: About, General, Screen Alerts, module...).
-local moduleTab = panel and panel.tabs and panel.tabs[4]
+-- Spell-ID editor on the Swapblaster tab (tabs: About, General, Screen Alerts, module...).
+local moduleTab = moduleTabOf("swapblaster")
 local editBox = moduleTab and findMultiLineEditBox(moduleTab)
 local saveBtn = moduleTab and findButton(moduleTab, "Save")
 local resetBtn = moduleTab and findButton(moduleTab, "Reset to Defaults")
@@ -2239,6 +2516,15 @@ check("/tattle is the chat command",
 check("the old chat command is not registered",
     SlashCmdList["SNITCH"] == nil and SLASH_SNITCH1 == nil,
     SlashCmdList["SNITCH"] ~= nil and "SlashCmdList[SNITCH] is still wired up" or nil)
+
+-- The version a player reads in /tattle status is the one the client would read out
+-- of the TOC, and this harness used to hand the addon a second, hand-typed copy of
+-- it ("0.2.0" against a TOC that said 0.2.0-alpha.3). Two places that must agree and
+-- are not checked are two places that drift - and the tag, the TOC and that printed
+-- line are how a bug report says which build someone is holding.
+check("the version the addon reports is the version in the TOC",
+    TOC_VERSION ~= nil and Tattle.VERSION == TOC_VERSION,
+    "addon says " .. tostring(Tattle.VERSION) .. ", Tattle.toc says " .. tostring(TOC_VERSION))
 
 -- /tattle probe toggles
 local okProbe1 = callSlash("probe")
@@ -2434,25 +2720,68 @@ end
 check("nothing that came from the client is compared with an empty string",
     #auditOffenders == 0, "\n  " .. table.concat(auditOffenders, "\n  "))
 
+-- How faithfully this file's fake secret values model a real client, stated rather than
+-- assumed. The stand-ins are proxy tables and the metamethods they install are the ones
+-- a client refuses - but `__len` on a table only exists from Lua 5.2, so on CI's lua5.1
+-- taking the length of a fake secret answers 0 instead of raising, and a check written
+-- against `#` would see cooperation the real client never gives. Local Lua is 5.5 and CI
+-- runs 5.1, so the two runs are not modelling the same client, and the difference is
+-- recorded here instead of being discovered by whoever trusts it next. Nothing in the
+-- addon may take the length of a value it did not create; the client-API audit above is
+-- what keeps that true.
+local lenRefused = not pcall(function() return #Secret.asSecret("a secret string") end)
+realPrint("== this interpreter (" .. _VERSION .. ") "
+    .. (lenRefused and "refuses" or "does NOT refuse") .. " # on a secret value ==")
+check("the fake secret values are as strict as this interpreter can be",
+    lenRefused or _VERSION == "Lua 5.1",
+    _VERSION .. " answered # on a secret value where a client would refuse")
+
 -- The core is the only place that knows which client APIs accept a secret value and
 -- which refuse it. A module calling UnitName or C_Spell.GetSpellName directly has
 -- stepped around that one layer, which is how the crash got into a module's reach in
 -- the first place. Probe is exempt: its whole job is finding out what a given client
 -- exposes, and every read in it is guarded for exactly that reason.
-local RAW_VALUE_APIS = { "UnitName(", "UnitDisplayName(", "C_Spell.GetSpellName(",
-    "C_Spell.GetSpellInfo(", "UnitIsUnit(" }
+--
+-- Each needle is a frontier pattern, `%f[%.%w]Name%(`: a match only where the name
+-- starts a word and is not preceded by a dot. Two reasons, and the audit was wrong
+-- without both:
+--
+--   * `Tattle.UnitDisplayName(x)` is the wrapper this addon *wants* modules to call,
+--     and a plain substring needle flags it, which is how an audit gets turned off;
+--   * the set is the set of characters that mean "not a boundary" - `.`, letters,
+--     digits, underscore. `%f[^%.%w]` looks like the same thing and is its opposite:
+--     a complemented class inside %f matches *inside* every run of those characters,
+--     so it finds nothing and the audit passes green on code it never looked at.
+--
+-- Which is also why the file list is built with `file:match("^Modules/")` and not
+-- `file:find("^Modules/", 1, true)`: with plain find turned on the second argument is
+-- a starting index, not a pattern, so the needle searched for was the nine characters
+-- `^Modules/` - which appears in no source line. This audit ran over exactly one file,
+-- Commands.lua, and reported clean for the three modules it exists to police.
+local RAW_VALUE_APIS = {
+    "%f[%.%w]UnitName%(",
+    "%f[%.%w]UnitDisplayName%(",
+    "%f[%.%w]UnitIsUnit%(",
+    "%f[%.%w]UnitExists%(",
+    "%f[%.%w]UnitAffectingCombat%(",
+    "C_Spell%.GetSpellName%(",
+    "C_Spell%.GetSpellInfo%(",
+    "%f[%.%w]C_UnitAuras%.",
+}
 local apiOffenders = {}
+local apiScanned = 0
 for _, file in ipairs(files) do
-    if file:find("^Modules/", 1, true) or file == "Commands.lua" then
+    if file:match("^Modules/") or file == "Commands.lua" then
         local handle = io.open(ADDON_DIR .. "/" .. file, "r")
         if handle then
+            apiScanned = apiScanned + 1
             local lineNo = 0
             for rawLine in handle:lines() do
                 lineNo = lineNo + 1
                 local line = rawLine:gsub("^%s+", "")
                 if not line:match("^%-%-") then
                     for _, api in ipairs(RAW_VALUE_APIS) do
-                        if line:find(api, 1, true) then
+                        if line:match(api) then
                             table.insert(apiOffenders, file .. ":" .. lineNo .. ": " .. line)
                         end
                     end
@@ -2462,6 +2791,12 @@ for _, file in ipairs(files) do
         end
     end
 end
+-- An audit that read no files is not a passing audit, and the bug above is exactly
+-- one of those: the count is asserted, so a broken file list fails instead of shipping
+-- the illusion of a rule.
+check("the client-API audit actually opened the files it polices",
+    apiScanned >= 4,
+    "scanned " .. apiScanned .. " file(s); every module and Commands.lua should be in it")
 check("no module or command reaches past the core's accessors for a client value",
     #apiOffenders == 0, "\n  " .. table.concat(apiOffenders, "\n  "))
 
@@ -2493,16 +2828,24 @@ local FUTURE_LUA = {
 }
 local luaOffenders = {}
 local ownPath = (debug.getinfo(1, "S").source or ""):gsub("^@", "")
-local toRead = { { ADDON_DIR .. "/Core.lua", "Core.lua" },
-                 { ADDON_DIR .. "/Probe.lua", "Probe.lua" },
-                 { ADDON_DIR .. "/Commands.lua", "Commands.lua" },
-                 { ADDON_DIR .. "/Modules/Swapblaster.lua", "Modules/Swapblaster.lua" },
-                 { ADDON_DIR .. "/Modules/CastSpells.lua", "Modules/CastSpells.lua" },
-                 { ADDON_DIR .. "/Modules/Silencer.lua", "Modules/Silencer.lua" },
-                 { ownPath, "Tests/wow_stub.lua" } }
+-- Every file that ships, from the TOC, plus this one - not a hand-written list of
+-- the files somebody remembered. A hard-coded list silently stops covering the addon
+-- the moment a file is added or renamed, and the three UI files this list used to
+-- omit (Config.lua, ScreenAlert.lua, ConfigSpellIDs.lua) are ones a player will
+-- notice: a `//` in any of them kills the config panel in the game, in silence.
+local toRead = { { ownPath, "Tests/wow_stub.lua" } }
+for _, file in ipairs(files) do
+    toRead[#toRead + 1] = { ADDON_DIR .. "/" .. file, file }
+end
+-- Again: opened, not intended. An empty or mistyped list would pass.
+check("the Lua-version audit reads every file that ships",
+    #toRead >= #files + 1,
+    "read " .. (#toRead - 1) .. " of " .. #files .. " shipped files")
+local luaScanned = 0
 for _, source in ipairs(toRead) do
     local handle = io.open(source[1], "r")
     if handle then
+        luaScanned = luaScanned + 1
         local lineNo = 0
         for rawLine in handle:lines() do
             lineNo = lineNo + 1
@@ -2522,6 +2865,11 @@ for _, source in ipairs(toRead) do
         handle:close()
     end
 end
+-- Opened, not merely listed: a file that is in the TOC but not on disk would leave
+-- this audit saying "clean" about a file it never read.
+check("the Lua-version audit read every file it claims to",
+    luaScanned == #toRead,
+    "opened " .. luaScanned .. " of " .. #toRead)
 check("nothing here needs a Lua newer than the one CI runs",
     #luaOffenders == 0, "\n  " .. table.concat(luaOffenders, "\n  "))
 

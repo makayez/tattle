@@ -27,6 +27,13 @@ local function HandleSlashCommand(msg)
 
     elseif msg == "off" then
         TattleDB.enabled = false
+        -- The probe rides its own frame and is not part of the module pipeline, so
+        -- turning the addon off would otherwise leave it printing a chat line for
+        -- every cast of a watched spell until somebody remembered to arm it off. The
+        -- probe is exempt from the core's in-combat silence on purpose (it is the
+        -- instrument for asking about combat), which makes this the only thing that
+        -- guarantees it stops.
+        Tattle.DisarmProbe(true)
         print("Tattle disabled.")
 
     elseif msg == "debug" then
@@ -43,6 +50,11 @@ local function HandleSlashCommand(msg)
         -- function is not in the retail API, and a nil here would error out of
         -- /tattle status at exactly the line meant for diagnosing problems.
         print("  Grouped:", Tattle.IsGrouped() and "YES" or "NO")
+        -- First among the reasons a player sees nothing, because it is the one that
+        -- is not a setting they changed: while this player is fighting the addon is
+        -- idle by design, so "no Swapblaster alerts in a raid" is answered here
+        -- instead of in a module's logic.
+        print("  In combat:", Tattle.IAmInCombat() and "YES - Tattle is silent while you fight" or "NO")
         print("  Debug:",   TattleDB.debug and "ON" or "OFF")
         print("Modules:")
         -- moduleOrder, not pairs(): a string-keyed table has no defined order, so
@@ -89,7 +101,12 @@ local function HandleSlashCommand(msg)
             print("Problems this session:")
             for _, kind in ipairs(kinds) do
                 local problem = problems[kind]
-                print(string_format("  %s  x%d  (%s)", kind, problem.count, problem.detail))
+                -- tostring on the detail: this file does not control what gets
+                -- reported (a module can report a problem with no detail at all), and
+                -- the client's Lua 5.1 string.format raises on a nil where a newer one
+                -- prints "nil" - so a missing detail used to break the very command
+                -- that exists to show the problem.
+                print(string_format("  %s  x%d  (%s)", kind, problem.count, tostring(problem.detail)))
             end
         end
 

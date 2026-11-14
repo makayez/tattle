@@ -16,6 +16,13 @@
 -- Like the modules, the probe only reports while you are grouped. Everything it
 -- measures (a swap, a grip, a rescue) needs a group, so a solo cast teaches
 -- nothing and the aura and target sweeps below would be pure waste.
+--
+-- Unlike the modules, it is not silenced while you are fighting - which is the one
+-- part of this addon that the core's "idle while you fight" rule lets through, and
+-- deliberately: the question this instrument exists to answer is what the client
+-- sends and withholds during a fight, and a diagnostic that goes quiet exactly when
+-- the interesting events begin is not a diagnostic. It reports only when a player
+-- arms it with /tattle probe, and /tattle off disarms it.
 
 local _, Tattle = ...
 
@@ -67,11 +74,16 @@ local function SpellNameFor(id)
     return info.name
 end
 
+function Tattle.DisarmProbe(silent)
+    if not Tattle._probeFrame then return end
+    Tattle._probeFrame:SetScript("OnEvent", nil)
+    Tattle._probeFrame = nil
+    if not silent then print("Tattle probe OFF.") end
+end
+
 function Tattle.ToggleProbe()
     if Tattle._probeFrame then
-        Tattle._probeFrame:SetScript("OnEvent", nil)
-        Tattle._probeFrame = nil
-        print("Tattle probe OFF.")
+        Tattle.DisarmProbe()
         return
     end
 
@@ -106,13 +118,17 @@ function Tattle.ToggleProbe()
     -- expensive thing in the addon.
     local lastContext = 0
 
-    f:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4, arg5, arg6)
+    local function Report(_, event, arg1, arg2, arg3, arg4, arg5, arg6)
         if not Tattle.IsGrouped() then return end
 
-        -- Resolve the spell name through the core, which resolves a secret spell ID
-        -- without inspecting the name it hands back.
-        local spellArg = (event == "UNIT_SPELLCAST_SENT") and (arg5 or arg3) or arg3
-        local spellName = Tattle.ResolveSpellName(spellArg) or SpellNameFor(spellArg)
+        -- type(), not `or`: a restricted client can hand the spell argument of a cast
+        -- event over as a secret value, and testing one for truthiness is an operation
+        -- on it. The same goes for the name ResolveSpellName hands back - it returns
+        -- that unexamined on purpose, so a caller may not `or` it either.
+        local spellArg = arg3
+        if event == "UNIT_SPELLCAST_SENT" and type(arg5) ~= "nil" then spellArg = arg5 end
+        local spellName = Tattle.ResolveSpellName(spellArg)
+        if type(spellName) == "nil" then spellName = SpellNameFor(spellArg) end
 
         -- Is the caster argument a plain token this probe can name, a secret the
         -- client will answer queries for but not let be printed, or nothing?
@@ -176,10 +192,12 @@ function Tattle.ToggleProbe()
         local shown, watchers = 0, {}
         for _, entry in ipairs(entries) do
             -- Every name here went through a helper that proves the client will let
-            -- it be printed before it is concatenated into a line.
+            -- it be printed before it is concatenated into a line. GetUnitShortName
+            -- answers nil for a unit that does not exist, so no separate existence
+            -- query is needed - and none of these reads is allowed to raise here.
             local name = Tattle.GetUnitShortName(entry.owner) or entry.owner
-            local targetName = UnitExists(entry.target) and Tattle.GetUnitShortName(entry.target)
-            if UnitIsUnit(entry.target, "player") then
+            local targetName = Tattle.GetUnitShortName(entry.target)
+            if Tattle.IsSameUnit(entry.target, "player") then
                 watchers[#watchers + 1] = name
                 targetName = name .. " (you)"
             end
@@ -191,6 +209,18 @@ function Tattle.ToggleProbe()
         end
         print(string_format("|cffff6600[Tattle Probe]|r   targeting you        -> %s",
             watchers[1] and table_concat(watchers, ", ") or "nobody we can read"))
+    end
+
+    -- Guarded end to end, because this is the instrument a player runs to find out
+    -- what a client will not let an addon read. A refused lookup has to show up as a
+    -- line in the report; it must not end the report, and it must not be the reason
+    -- they give up on the one tool that answers the question.
+    f:SetScript("OnEvent", function(frame, event, ...)
+        local ok, err = pcall(Report, frame, event, ...)
+        if not ok then
+            print("|cffff6600[Tattle Probe]|r " .. event
+                .. ": the probe could not read this event: " .. tostring(err))
+        end
     end)
 
     Tattle._probeFrame = f
