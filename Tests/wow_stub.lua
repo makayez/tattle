@@ -21,6 +21,13 @@ instead of passing silently.
 
 local ADDON_DIR = (arg and arg[1]) or "."
 
+-- The restricted-content value model, defined further down and used by the API
+-- stubs above it. Declared up here because a function can only close over a local
+-- that is already in scope where the function is written, and this harness is a
+-- single chunk: written any other way these calls compile to a global lookup that
+-- reads nil.
+local Secret
+
 -- ============================================================================
 -- FrameXML-ish helpers
 -- ============================================================================
@@ -51,6 +58,7 @@ local eventFrames = {}     -- event name -> { frame, ... }
 local timers = {}
 local tickers = {}         -- { interval = n, fn = f, Cancel = ... }, for manual sweeps
 local sentMessages = {}
+local chatRefusals = {}   -- chat lines the client itself refused to send
 local printLog = {}
 
 local newFrame
@@ -222,7 +230,146 @@ time = function() return clock end
 
 -- Tests move the clock by hand so a channeled cast can be made to look either
 -- completed or cut short.
-local function setClock(t) clock = t end
+--
+-- `setClock` may not wind it back. A client's clock does not, and a test that asked
+-- for a round number earlier in the timeline than the one it replaced got a freebie
+-- it had not paid for: a module record left behind by the scenario before it was
+-- *newer* than the clock, so subtracting from the age made a stale record look fresh
+-- (or a fresh one look ancient) and the check passed for a reason that could not
+-- happen. `advanceClock` is the honest way to say "long enough for that record to
+-- stop describing its cast". A rewind is refused, reported, and checked for.
+local clockRewinds = {}
+local function setClock(t)
+    if t < clock then
+        clockRewinds[#clockRewinds + 1] = string.format("line %d: %s -> %s",
+            debug.getinfo(2).currentline, tostring(clock), tostring(t))
+        return
+    end
+    clock = t
+end
+
+local function advanceClock(seconds) clock = clock + seconds end
+
+Secret = (function()
+    -- ========================================================================
+    -- Restricted content: what a secret value is in this stub
+    -- ========================================================================
+    --
+    -- A 12.x client runs M+ and rated PvP as *restricted content*: the cast events
+    -- it delivers there carry secret values, and a secret value may only be handed
+    -- to an API documented to accept one. Comparing it, concatenating it, taking its
+    -- length, indexing it, printing it or formatting it all raise -- and `type()`
+    -- still answers "string", which is the trap the alpha.3 crash walked into: it
+    -- died at `name ~= ""`, one line after a `type(name) == "string"` test had
+    -- already passed.
+    --
+    -- The model here is an unindexable table standing in for a value, with the
+    -- client's refusals wired to its metamethods. The value it stands for lives in a
+    -- registry only this file can read, which is what lets the stub answer
+    -- UnitIsUnit, UnitExists or a spell name for a secret operand the way the client
+    -- does -- and what keeps the addon from doing the same.
+    --
+    -- Two limits, stated because a check that cannot fail is worse than no check:
+    --
+    --   * Lua 5.1 consults __eq for two tables only, so `secret ~= "a literal"` -
+    --     the actual alpha.3 line - cannot be made to raise here: Lua answers a
+    --     table-versus-string comparison by type alone. The equality half of the
+    --     class is guarded by the source audit at the end of the run instead.
+    --   * Indexing a table with a secret key is a refusal on a real client and a
+    --     plain miss here, so the core reaches its "ask the client instead" path
+    --     through the type test rather than through the raise. Same helper either
+    --     way, and the helper is what the checks exercise.
+
+    local registry = {}      -- proxy -> the value it stands for
+    local refusals = 0       -- how many times something tried to touch one
+
+    local function asSecret(value)
+        local proxy = setmetatable({}, {
+            __index = function()
+                refusals = refusals + 1
+                error("attempt to index a secret value, while execution tainted by 'Tattle'", 0)
+            end,
+            __newindex = function()
+                refusals = refusals + 1
+                error("attempt to modify a secret value, while execution tainted by 'Tattle'", 0)
+            end,
+            __call = function()
+                refusals = refusals + 1
+                error("attempt to call a secret value, while execution tainted by 'Tattle'", 0)
+            end,
+            __concat = function()
+                refusals = refusals + 1
+                error("attempt to concatenate a secret string value, while execution tainted by 'Tattle'", 0)
+            end,
+            __len = function()
+                refusals = refusals + 1
+                error("attempt to get length of a secret string value, while execution tainted by 'Tattle'", 0)
+            end,
+            __tostring = function()
+                refusals = refusals + 1
+                error("attempt to convert a secret string value to a string", 0)
+            end,
+            __eq = function()
+                refusals = refusals + 1
+                error("attempt to compare two secret values, while execution tainted by 'Tattle'", 0)
+            end,
+            __lt = function()
+                refusals = refusals + 1
+                error("attempt to compare secret values, while execution tainted by 'Tattle'", 0)
+            end,
+            __le = function()
+                refusals = refusals + 1
+                error("attempt to compare secret values, while execution tainted by 'Tattle'", 0)
+            end,
+        })
+        registry[proxy] = value
+        return proxy
+    end
+
+    local function isSecretValue(value)
+        return type(value) == "table" and registry[value] ~= nil
+    end
+
+    -- The stub's own look at a value the addon may not look at. The registry is
+    -- indexed by identity - a lookup in *this file's* table, never an index into the
+    -- value - which is the difference between a client answering a question about a
+    -- secret unit and an addon being allowed to inspect one.
+    local function underlying(value)
+        if type(value) == "table" and registry[value] ~= nil then return registry[value] end
+        return value
+    end
+
+    -- A spell ID that arrived as a secret value, back to an ID this stub's spell
+    -- table can look up. Only this file may do that, and the whole point of the
+    -- checks is that the addon cannot.
+    local function spellIdValue(id)
+        local plain = underlying(id)
+        if type(plain) == "number" then return plain end
+        return tonumber(plain) or plain
+    end
+
+    -- True while the checks are simulating restricted content.
+    local context = false
+
+    -- A restricted client will not name another player. Your own name is your own.
+    local function nameForReporting(token, name)
+        if not name then return nil end
+        if not context then return name end
+        if underlying(token) == "player" then return name end
+        return asSecret(name)
+    end
+
+    return {
+        asSecret = asSecret,
+        isSecretValue = isSecretValue,
+        underlying = underlying,
+        spellIdValue = spellIdValue,
+        nameForReporting = nameForReporting,
+        setContext = function(on) context = on and true or false end,
+        refusals = function() return refusals end,
+        resetRefusals = function() refusals = 0 end,
+    }
+end)()
 
 -- UnitCastingInfo/UnitChannelInfo return
 -- (name, text, texture, startTime, endTime, isTrade, notInterruptible, spellID).
@@ -240,6 +387,13 @@ local function setCombatUnits(...) combatUnits = {} for _, u in ipairs({...}) do
 
 PlaySound = function() return true end
 SendChatMessage = function(message, channel)
+    -- The client's rule, applied at the boundary: a secret value does not belong in
+    -- a chat message. A message *built* out of one failed earlier, so this is the
+    -- backstop for a name handed straight through.
+    if Secret.isSecretValue(message) then
+        table.insert(chatRefusals, tostring(message))
+        error("attempt to send a secret string value, while execution tainted by 'Tattle'", 0)
+    end
     table.insert(sentMessages, { message = message, channel = channel })
 end
 
@@ -280,7 +434,11 @@ local function setGroup(opts)
 end
 
 -- Two different tokens name the same player when one of them is your raid index.
+-- underlying() first, because a restricted client reports the *same* unit under a
+-- secret token, and every question in this file is about the unit, not about the
+-- spelling of its name.
 local function isMe(token)
+    token = Secret.underlying(token)
     return token == "player" or (group.inRaid and token == "raid" .. group.selfIndex)
 end
 
@@ -325,6 +483,7 @@ local targets = {}
 unitExistsCalls, unitIsUnitCalls = 0, 0
 
 local function unitExists(unit)
+    unit = Secret.underlying(unit)
     if string.match(unit, "target$") then return targets[unit] ~= nil end
     return nameFor(unit) ~= nil
 end
@@ -333,12 +492,13 @@ UnitExists = function(unit)
     return unitExists(unit)
 end
 UnitName = function(unit)
-    local owner = string.match(unit, "^(.-)target$")
+    local token = Secret.underlying(unit)
+    local owner = string.match(token, "^(.-)target$")
     if owner then
-        local who = targets[unit]
-        return who and (nameFor(who) or who)
+        local who = targets[token]
+        return Secret.nameForReporting(token, who and (nameFor(who) or who))
     end
-    return nameFor(unit)
+    return Secret.nameForReporting(token, nameFor(token))
 end
 local function unitIsUnit(a, b)
     -- `<unit>target` tokens answer as whoever they point at, and a target the
@@ -347,6 +507,7 @@ local function unitIsUnit(a, b)
     -- "raid1target is player" -- the same person under two tokens, which is exactly
     -- the mistake the addon is supposed to stop making.
     local function resolve(u)
+        u = Secret.underlying(u)
         if type(u) ~= "string" then return nil end
         if string.match(u, "target$") then return targets[u] end
         return u
@@ -366,6 +527,7 @@ end
 -- UnitInParty("player") is not.
 UnitInRaid = function(unit)
     if not group.inRaid then return nil end
+    unit = Secret.underlying(unit)
     if isMe(unit) then return group.selfIndex end
     local n = tonumber(string.match(unit, "^raid(%d+)$"))
     if n and n <= group.count then return n end
@@ -373,6 +535,7 @@ UnitInRaid = function(unit)
 end
 UnitInParty = function(unit)
     if not group.party then return nil end
+    unit = Secret.underlying(unit)
     if unit == "player" then return nil end
     local n = tonumber(string.match(unit, "^party(%d+)$"))
     if n and n <= group.count - 1 then return n end
@@ -396,15 +559,37 @@ local spellNames = {
 
 C_Spell = {
     GetSpellInfo = function(id)
-        local name = spellNames[id]
+        local name = spellNames[Secret.spellIdValue(id)]
         if not name then return nil end
+        -- A name derived from a secret spell ID is itself secret: safe to hand to
+        -- another API, useless to compare, print or store as a key.
+        if Secret.isSecretValue(id) then name = Secret.asSecret(name) end
         return { spellID = id, name = name }
     end,
     -- The allocation-free name lookup the real client has. The core prefers this
     -- and only falls back to GetSpellInfo without it, which a later check proves
     -- by taking it away.
     GetSpellName = function(id)
-        return id and spellNames[id] or nil
+        local name = id and spellNames[Secret.spellIdValue(id)] or nil
+        if name and Secret.isSecretValue(id) then name = Secret.asSecret(name) end
+        return name
+    end,
+}
+
+-- The client's sanctioned way to ask a question about a secret value: compare it
+-- with a plain one, and get a plain answer back. `secretCompareSupported` models a
+-- build that has the table but refuses the comparison - which for the addon is the
+-- same dead end as not having it, and which the core captured at load time, so it
+-- has to be switched inside this stub rather than by deleting the global.
+local secretCompareSupported = true
+C_SecretComparisons = {
+    Equal = function(a, b)
+        if not secretCompareSupported then
+            error("attempt to compare a secret value on a client that will not compare one", 0)
+        end
+        local left, right = Secret.underlying(a), Secret.underlying(b)
+        if type(left) ~= type(right) then return false end
+        return left == right
     end,
 }
 
@@ -669,6 +854,15 @@ end
 
 Tattle = namespace
 
+do
+-- ---------------------------------------------------------------------------
+-- One scope for the checks. This harness is a single chunk, and Lua caps a
+-- function at 200 locals: the stub client above plus the checks below together
+-- outrun that, and the limit is a limit rather than a suggestion. Everything the
+-- audits after this block need (frames, printLog, checks, nilGeometry) is declared
+-- outside it.
+-- ---------------------------------------------------------------------------
+
 realPrint("== Checks ==")
 
 -- CHECKS (each one guards behaviour that broke once, or would break silently):
@@ -718,10 +912,26 @@ realPrint("== Checks ==")
 --     being involved in a cast mentions it; pets, minions and NPCs are rejected
 --     before their spell is ever named, unless a module asked for every caster,
 --     and your own casts still alert
+-- 20. one cast, one alert: the two event halves of a swap - and the same cast
+--     reported once as your raid index and once as "player" - cannot announce a
+--     swap twice, and neither a record that never terminated nor a settled
+--     tombstone is allowed to mute that caster's next cast
+-- 21. restricted content, which is where this addon's whole reason for existing
+--     happens: with the spell ID, the cast GUID and the caster token all secret
+--     values, a swap is still announced, is never given a name the client refused
+--     to give, touches nothing the client forbids, and - on a build with no
+--     secret-comparison API - is reported to the player as a refusal rather than
+--     answered as "not a cast we watch". The probe reads the same events without
+--     throwing, and `/tattle status` lists what was refused and how often.
+-- 22. the core's start gate is proven to *drop* as well as to allow. A policy that
+--     gated nothing is invisible to every other check in this file, and "start"
+--     gating nothing is exactly what alpha.3 shipped.
 --
--- Two audits run alongside the checks: widget keys the stub does not model are
--- printed at the end (a new one is usually a typo), and a widget setter handed
--- `nil` where the client demands a number is a failure rather than a shrug.
+-- Five audits run alongside the checks. Two are about the stub: widget keys it does
+-- not model are printed at the end (a new one is usually a typo), and a widget
+-- setter handed `nil` where the client demands a number is a failure rather than a
+-- shrug. Three are about the source, because part of the restricted-value bug class
+-- cannot be made to raise at runtime in a Lua 5.1 harness at all.
 
 check("all files load", #loadErrors == 0, table.concat(loadErrors, "; "))
 
@@ -749,6 +959,66 @@ check("modules registered in TOC order",
     Tattle.moduleOrder[1] == "swapblaster" and Tattle.moduleOrder[2] == "lifegrip"
         and Tattle.moduleOrder[3] == "rescue",
     table.concat(Tattle.moduleOrder, ", "))
+
+-- One event, one call per listener. The reported bug was alerts arriving twice, and
+-- there are two ways for that to be the core's fault rather than a module's: a module
+-- listing the same event twice in its own registration, and something waking the
+-- dispatcher twice for one client event. Neither shows up in any other check here,
+-- because a module that is called twice and dedupes internally *looks* correct. So the
+-- counting happens on the module's own door, not on what it says.
+local onEventCalls = {}
+local originalHandlers = {}
+for _, moduleId in ipairs(Tattle.moduleOrder) do
+    local module = Tattle.modules[moduleId]
+    originalHandlers[moduleId] = module.onEvent
+    onEventCalls[moduleId] = 0
+    local id = moduleId
+    module.onEvent = function(event, ...)
+        onEventCalls[id] = onEventCalls[id] + 1
+        return originalHandlers[id](event, ...)
+    end
+end
+-- raid3 in a five-deep raid is the one numbered token no other scenario in this file
+-- dispatches a Swapblaster on, which is what keeps the record this arms from leaking
+-- into a check after it. The clock is deliberately left alone, because a scenario that
+-- moves it forward makes every absolute setClock after it a rewind.
+resetWorld()
+setGroup({ raid = true, count = 5, selfIndex = 4 })
+table.wipe(sentMessages)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid3", "guid-one-call", 161399)
+runTimers()
+local callComplaints = {}
+for _, moduleId in ipairs(Tattle.moduleOrder) do
+    local wanted = 0
+    for _, ev in ipairs(Tattle.modules[moduleId].events) do
+        if ev == "UNIT_SPELLCAST_CHANNEL_START" then wanted = 1 end
+    end
+    if onEventCalls[moduleId] ~= wanted then
+        callComplaints[#callComplaints + 1] = string.format("%s called %d time(s), wanted %d",
+            moduleId, onEventCalls[moduleId], wanted)
+    end
+end
+for _, moduleId in ipairs(Tattle.moduleOrder) do
+    Tattle.modules[moduleId].onEvent = originalHandlers[moduleId]
+end
+check("one cast event wakes each listening module exactly once",
+    #callComplaints == 0, table.concat(callComplaints, "; "))
+
+-- A module that asks for the same event twice is the same mistake in its own file, and
+-- the core now absorbs it -- which is why it has to be said out loud here: a repeat the
+-- core quietly swallows is a repeat nobody ever fixes.
+local duplicateEvents = {}
+for _, moduleId in ipairs(Tattle.moduleOrder) do
+    local seen = {}
+    for _, ev in ipairs(Tattle.modules[moduleId].events) do
+        if seen[ev] then
+            duplicateEvents[#duplicateEvents + 1] = moduleId .. " lists " .. ev .. " twice"
+        end
+        seen[ev] = true
+    end
+end
+check("no module asks for the same event twice",
+    #duplicateEvents == 0, table.concat(duplicateEvents, "; "))
 
 check("modules ship the spell IDs verified against the live 12.1.5 database",
     Tattle.modules.swapblaster.defaultSpellIDs[1] == 161399
@@ -962,6 +1232,356 @@ runTimers()
 check("the two halves of one cast are still announced once",
     #sentMessages == 1, "got " .. #sentMessages)
 
+-- A dump for the duplicate-alert checks below: when a count is wrong, "got 4" on
+-- its own tells you nothing about which four.
+local function messageLog()
+    local parts = {}
+    for i = 1, #sentMessages do table.insert(parts, "[" .. i .. "] " .. sentMessages[i].message) end
+    return "got " .. #sentMessages .. ": " .. table.concat(parts, "  |  ")
+end
+
+-- Every scenario below runs in a five-deep raid, on the two raid tokens no
+-- neighbouring check uses, and puts the alert settings it changed back when it is
+-- done. Two reasons, both of them about leaks:
+--
+--   * A module's cast records survive resetWorld(). Resetting the *world* is not
+--     wiping what a module remembers, and a scenario that quietly inherited a record
+--     from the one before it - or handed one to the check after it - would pass, or
+--     fail, for the wrong reason. Fresh tokens make the records uninheritable.
+--   * alertMode() writes into the shipped settings, which the checks after this one
+--     read as they found them.
+local savedSettings = {}
+local function isolateAlerts(moduleId)
+    local settings = TattleDB.modules[moduleId]
+    if savedSettings[moduleId] then return end
+    local snapshot = { scope = settings.scope, enabled = settings.enabled, alerts = {} }
+    for key, value in pairs(settings.alerts) do snapshot.alerts[key] = value end
+    savedSettings[moduleId] = snapshot
+    alertMode(moduleId, "YELL")
+end
+
+local function fiveDeepRaid(selfIndex)
+    resetWorld()
+    setGroup({ raid = true, count = 5, selfIndex = selfIndex })
+end
+
+local function restoreAlertSettings()
+
+    for moduleId, snapshot in pairs(savedSettings) do
+        local settings = TattleDB.modules[moduleId]
+        settings.scope, settings.enabled = snapshot.scope, snapshot.enabled
+        for key, value in pairs(snapshot.alerts) do settings.alerts[key] = value end
+    end
+    table.wipe(savedSettings)
+    resetWorld()
+end
+
+-- The other half of a cast can arrive *after* that cast was already settled. A
+-- resolved record used to suppress terminal events only, so the order a live client
+-- really produces for an interrupted channeled swap - CHANNEL_START, INTERRUPTED, and
+-- then the plain START that the channeled-spell hack also sends - armed a second
+-- record for a cast that had already been announced, and every alert for it came out
+-- twice. That is the reported "Malloc is casting Swapblaster" and "Malloc's
+-- Swapblaster was interupted", both x2, for one swap.
+fiveDeepRaid(5)
+isolateAlerts("swapblaster")
+table.wipe(sentMessages)
+setClock(4800)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-half-late", 161399)
+setClock(4801)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid4", "guid-half-late", 161399)
+setClock(4802)
+local halfLate = dispatch("UNIT_SPELLCAST_START", "raid4", "guid-half-late", 161399)
+runTimers()
+check("a late start half of a settled cast is not armed as a second cast",
+    #halfLate == 0 and #sentMessages == 2, messageLog())
+check("and what survives is the start and the interrupt, in that order",
+    sentMessages[1] and sentMessages[1].message:find("is casting Swapblaster", 1, true) ~= nil
+        and sentMessages[2] and sentMessages[2].message:find("was interrupted", 1, true) ~= nil,
+    messageLog())
+
+-- The mirror image: a settled plain cast whose channeled half arrives late, its own
+-- terminal half included.
+fiveDeepRaid(5)
+table.wipe(sentMessages)
+setClock(4900)
+dispatch("UNIT_SPELLCAST_START", "raid5", "guid-half-early", 161399)
+setClock(4901)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid5", "guid-half-early", 161399)
+setClock(4902)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid5", "guid-half-early", 161399)
+local lateChannel = dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid5", "guid-half-early", 161399)
+runTimers()
+check("and the same in the other order: a late channel half changes nothing",
+    #lateChannel == 0 and #sentMessages == 2, messageLog())
+
+-- (The clocks in this whole section run forward in file order, by a slice each.
+-- A module's records outlive a world reset, so a scenario that reused a token *or*
+-- a timestamp from the one before it would inherit that record and pass or fail for
+-- the wrong reason.)
+--
+-- The halves of one client-side action do not have to arrive carrying the same
+-- identity. The plain half and the channeled half are separate client records of one
+-- cast, each with its own GUID -- which is exactly why keying the dedupe on the GUID
+-- *alone* would satisfy the check above and leave the reported duplicate untouched.
+fiveDeepRaid(5)
+table.wipe(sentMessages)
+setClock(4940)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid5", "guid-half-b1", 161399)
+setClock(4941)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid5", "guid-half-b1", 161399)
+setClock(4941.5)
+dispatch("UNIT_SPELLCAST_START", "raid5", "guid-half-b2", 161399)
+setClock(4942)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid5", "guid-half-b2", 161399)
+runTimers()
+check("the two halves of one swap, each carrying its own identity, are still one alert",
+    #sentMessages == 2, messageLog())
+
+fiveDeepRaid(5)
+table.wipe(sentMessages)
+setClock(4960)
+dispatch("UNIT_SPELLCAST_START", "raid5", "guid-half-c1", 161399)
+setClock(4961)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid5", "guid-half-c1", 161399)
+setClock(4961.5)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid5", "guid-half-c2", 161399)
+setClock(4962)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid5", "guid-half-c2", 161399)
+runTimers()
+check("and neither half is announced on its own once that cast has an outcome",
+    #sentMessages == 2, messageLog())
+
+-- The other way one cast becomes two alerts: a raid client that lists you as your own
+-- raidN index reports your casts both as "player" and as that index. State keyed on
+-- whichever token an event happened to carry holds two records for one cast, and each
+-- record gets to announce it.
+fiveDeepRaid(4)   -- you are raid4 here, so raid4 and player name the same player
+table.wipe(sentMessages)
+setClock(5000)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-two-tokens", 161399)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "player", "guid-two-tokens", 161399)
+runTimers()
+check("one cast reported under your raid index and as player is one alert",
+    #sentMessages == 1, messageLog())
+
+fiveDeepRaid(4)
+table.wipe(sentMessages)
+setClock(5100)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-two-tokens", 161399)
+setClock(5101)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "player", "guid-two-tokens", 161399)
+setClock(5102)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid4", "guid-two-tokens", 161399)
+runTimers()
+check("and its interrupt, reported under both tokens again, is one alert",
+    #sentMessages == 2, messageLog())
+check("which is the start and then the interrupt, not the same message twice",
+    sentMessages[1].message:find("is casting", 1, true) ~= nil
+        and sentMessages[2].message:find("was interrupted", 1, true) ~= nil
+        and sentMessages[1].message ~= sentMessages[2].message,
+    messageLog())
+
+-- A record armed by a start that never terminated used to hang around forever, and an
+-- unresolved record suppresses everything that follows: one cast whose end this client
+-- never reported muted that unit's Swapblaster for the rest of the session.
+fiveDeepRaid(5)
+table.wipe(sentMessages)
+setClock(5200)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid5", "guid-never-ended", 161399)
+runTimers()
+local mutedFirst = #sentMessages
+setClock(5260)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid5", "guid-the-next-one", 161399)
+runTimers()
+check("a cast that was never terminated stops muting the unit once it is stale",
+    mutedFirst == 1 and #sentMessages == 2, messageLog())
+
+-- And the settled record must expire the same way, or its tombstone outlives the cast
+-- it was a tombstone for. Same GUID on purpose: GUID equality cannot be what keeps a
+-- mute alive forever.
+fiveDeepRaid(5)
+table.wipe(sentMessages)
+setClock(5300)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-ancient", 161399)
+setClock(5301)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid4", "guid-ancient", 161399)
+runTimers()
+local settledFirst = #sentMessages
+setClock(5360)
+local ancient = dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-ancient", 161399)
+runTimers()
+check("a settled record older than its window does not mute a fresh cast",
+    #ancient == 0 and settledFirst == 2 and #sentMessages == 3, messageLog())
+
+-- The same permanent-mute shape in the grip modules, which keyed their state on a
+-- boolean rather than on any time at all: a START that never got an outcome left the
+-- unit armed for the rest of the run, so any later INTERRUPTED - of a different cast
+-- entirely - was announced as if it belonged to the first one.
+fiveDeepRaid(5)
+isolateAlerts("lifegrip")
+table.wipe(sentMessages)
+setClock(5400)
+dispatch("UNIT_SPELLCAST_START", "raid5", "grip-abandoned", 73325)
+runTimers()
+local gripArmedCount = #sentMessages
+setClock(5460)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid5", "grip-someone-else", 73325)
+runTimers()
+check("an abandoned arm does not announce a much later interrupt as its own",
+    gripArmedCount == 1 and #sentMessages == 1, messageLog())
+
+fiveDeepRaid(5)
+table.wipe(sentMessages)
+setClock(5500)
+dispatch("UNIT_SPELLCAST_START", "raid4", "grip-fresh", 73325)
+setClock(5501)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid4", "grip-fresh", 73325)
+runTimers()
+check("while an interrupt inside the window for the cast it belongs to is announced",
+    #sentMessages == 2, messageLog())
+
+restoreAlertSettings()
+
+-- ==========================================================================
+-- Restricted content: M+, rated PvP, and the values a 12.x client will not
+-- hand this addon
+-- ==========================================================================
+--
+-- The alpha.3 crash was not a nil check somebody forgot. In restricted content
+-- the client hands cast events *secret* values - the spell ID, the name derived
+-- from it, the caster token, the cast GUID - and a secret value may only be given
+-- to an API documented to accept one. `type()` still answers "string", so the
+-- guard that looked correct (`if type(name) == "string"`) passed, and the next
+-- line died comparing that string with a literal. Restricted content is also the
+-- only place M+ and rated PvP griefing happens, so this is not an edge case the
+-- feature can afford to get wrong: it is the case the feature exists for.
+--
+-- The checks below run the real dispatch path with every event argument secret.
+-- They assert three separate things: the alert still happens, the alert never
+-- claims a name the client refused to give, and the addon never touches a value
+-- the client forbids (the stub counts each refusal it was asked to make).
+
+local function countProblems()
+    local total = 0
+    for _, problem in pairs(Tattle.SessionProblems()) do total = total + problem.count end
+    return total
+end
+
+fiveDeepRaid(5)
+isolateAlerts("swapblaster")
+table.wipe(sentMessages)
+Secret.setContext(true)
+local secretRefusals = Secret.refusals()
+local problemsQuiet = countProblems()
+
+-- Caster token, cast GUID and spell ID, all three secret, exactly as a Mythic+
+-- client delivers them.
+setClock(5600)
+local restrictedCast = dispatch("UNIT_SPELLCAST_CHANNEL_START",
+    Secret.asSecret("raid4"), Secret.asSecret("guid-restricted"), Secret.asSecret(161399))
+runTimers()
+check("a swap inside restricted content is still announced",
+    #restrictedCast == 0 and #sentMessages == 1, messageLog())
+check("naming it falls back to someone, never to a name this client would not print",
+    messageContaining("someone is casting Swapblaster") ~= nil, messageLog())
+
+setClock(5601)
+local restrictedEnd = dispatch("UNIT_SPELLCAST_INTERRUPTED",
+    Secret.asSecret("raid4"), Secret.asSecret("guid-restricted"), Secret.asSecret(161399))
+runTimers()
+check("its secret-carrying interrupt half is announced once, not twice",
+    #restrictedEnd == 0 and #sentMessages == 2, messageLog())
+
+-- The reported duplicate, in the content it was actually reported from: one cast
+-- of yours, delivered once as "player" and once as your own raid index, both
+-- under secret tokens.
+fiveDeepRaid(4)
+table.wipe(sentMessages)
+setClock(5700)
+dispatch("UNIT_SPELLCAST_CHANNEL_START",
+    Secret.asSecret("raid4"), Secret.asSecret("guid-self-a"), Secret.asSecret(161399))
+dispatch("UNIT_SPELLCAST_CHANNEL_START",
+    Secret.asSecret("player"), Secret.asSecret("guid-self-b"), Secret.asSecret(161399))
+runTimers()
+check("your own swap, reported twice under two secret tokens, alerts once",
+    #sentMessages == 1, messageLog())
+
+fiveDeepRaid(4)
+table.wipe(sentMessages)
+setClock(5800)
+dispatch("UNIT_SPELLCAST_CHANNEL_START",
+    Secret.asSecret("raid4"), Secret.asSecret("guid-self-c"), Secret.asSecret(161399))
+setClock(5801)
+dispatch("UNIT_SPELLCAST_INTERRUPTED",
+    Secret.asSecret("player"), Secret.asSecret("guid-self-c"), Secret.asSecret(161399))
+setClock(5802)
+dispatch("UNIT_SPELLCAST_INTERRUPTED",
+    Secret.asSecret("raid4"), Secret.asSecret("guid-self-c"), Secret.asSecret(161399))
+runTimers()
+check("and its interrupt, delivered under both secret tokens, alerts once",
+    #sentMessages == 2, messageLog())
+
+check("the addon never tried to look inside a value the client forbids",
+    Secret.refusals() == secretRefusals,
+    "the client was asked to refuse " .. (Secret.refusals() - secretRefusals) .. " more time(s)")
+check("and none of it needed a problem reported to work",
+    countProblems() == problemsQuiet,
+    "reported problems: " .. tostring(countProblems() - problemsQuiet))
+
+-- The client named the cast and then refused to say whether it was one of ours:
+-- a build with no secret-comparison API. Answering that "no" would silently drop
+-- every swap in the exact content the alerts are for, which is the failure the
+-- original bug report was about ("nothing fired in M+"). It has to be said out
+-- loud, and counted, and it must never be reported as an ordinary non-cast.
+fiveDeepRaid(5)
+table.wipe(sentMessages)
+local beforeDenied = countProblems()
+secretCompareSupported = false
+setClock(5900)
+local denied = dispatch("UNIT_SPELLCAST_CHANNEL_START",
+    Secret.asSecret("raid4"), Secret.asSecret("guid-denied"), Secret.asSecret(161399))
+secretCompareSupported = true
+Secret.setContext(false)
+runTimers()
+check("a cast the client will not compare is announced as nothing rather than as no cast",
+    #denied == 0 and #sentMessages == 0, messageLog())
+check("and that refusal is told to you, once, in chat",
+    lastPrintContaining("would not say whether a cast was one Tattle watches") ~= nil)
+check("and it is counted where /tattle status can reach it",
+    countProblems() == beforeDenied + 1)
+callSlash("status")
+check("so /tattle status names the problem and its count",
+    lastPrintContaining("the client would not say whether a cast was one Tattle watches") ~= nil
+        and lastPrintContaining("C_SecretComparisons is unavailable") ~= nil)
+
+-- The probe reads the same event arguments a module sees, and it reads them for
+-- units a module would never ask about. It has to describe what it was refused
+-- instead of dying on it.
+fiveDeepRaid(5)
+Secret.setContext(true)
+callSlash("probe")
+setClock(5910)
+local probeErrors = dispatch("UNIT_SPELLCAST_CHANNEL_START",
+    Secret.asSecret("raid4"), Secret.asSecret("guid-probe"), Secret.asSecret(161399))
+runTimers()
+Secret.setContext(false)
+callSlash("probe")
+do
+    -- The probe prints one line per cast event, with each argument described rather
+    -- than read. On a real client the description of a secret value is
+    -- "secret (not printable)"; in this stub the stand-in is an unindexable table,
+    -- so the wording is "not readable". What the check cares about is that it said
+    -- it could not look, printed no name the client had refused, and survived.
+    local probeLine = lastPrintContaining("UNIT_SPELLCAST_CHANNEL_START") or ""
+    local described = probeLine:find("not readable", 1, true) ~= nil
+        or probeLine:find("not printable", 1, true) ~= nil
+    check("the probe reads a restricted event without throwing",
+        #probeErrors == 0 and described, probeLine)
+    check("and does not print a caster name this client would not print",
+        probeLine:find("Syrup", 1, true) == nil, probeLine)
+end
+
 -- A backfire with several protected members is usually a guessing game. With the
 -- caster's target readable, the guess is unnecessary: the buffed player they were
 -- looking at is the one whose protection set the blast off.
@@ -1031,7 +1651,7 @@ check("Rescue names the passenger, not the Evoker who cast it",
 alertMode("swapblaster", "PRIVATE")
 TattleDB.modules.swapblaster.alerts.console = true
 table.wipe(sentMessages)
-setClock(3000)
+advanceClock(60)
 dispatch("UNIT_SPELLCAST_START", "raid1", "guid-7", 161399)
 runTimers()
 check("chatType PRIVATE sends nothing to chat", #sentMessages == 0, "got " .. #sentMessages)
@@ -1082,7 +1702,7 @@ TattleDB.modules.swapblaster.scope = "self"
 check("scope self cannot rule out a Swapblaster",
     Tattle.ScopeDrops("swapblaster", "raid2") == false)
 table.wipe(sentMessages)
-setClock(4000)
+advanceClock(60)
 dispatch("UNIT_SPELLCAST_START", "raid2", "guid-10", 161399)
 runTimers()
 check("scope self keeps a Swapblaster warning it cannot place", #sentMessages == 1,
@@ -1100,7 +1720,7 @@ alertMode("swapblaster", "YELL")
 resetWorld()
 setCombatUnits("raid1")
 table.wipe(sentMessages)
-setClock(5000)
+advanceClock(60)
 dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-combat", 161399)
 runTimers()
 check("a Swapblaster cast start is not evaluated while the caster is fighting",
@@ -1111,9 +1731,9 @@ check("a Swapblaster cast start is not evaluated while the caster is fighting",
 -- completion event can arrive after combat did.
 setCombatUnits()
 table.wipe(sentMessages)
-setClock(5100)
+advanceClock(60)
 dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-straddle", 161399)
-setClock(5102)
+advanceClock(2)
 setCombatUnits("raid1")
 dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-straddle", 161399)
 runTimers()
@@ -1142,6 +1762,32 @@ dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-lg-ooc", 73325)
 runTimers()
 check("and the same caster alerts once out of combat", #sentMessages == 1, "got " .. #sentMessages)
 resetWorld()
+
+-- The *drop* half of the "start" policy had no check at all, and the drop half is
+-- the one that can fail invisibly. In alpha.3 OUT_OF_COMBAT_EVENTS.start was built
+-- from a global that had not been defined yet, so the entry was nil, the gate matched
+-- nothing, and every check in this file still passed - while the harness printed
+-- "module swapblaster asked for outOfCombat policy \"start\", which is not a thing"
+-- and nobody was looking at the harness output. A gate that gates nothing is
+-- indistinguishable from a gate that gates correctly, except to the raid that gets
+-- told about casts the game does not allow to happen.
+fiveDeepRaid(5)
+isolateAlerts("swapblaster")
+table.wipe(sentMessages)
+advanceClock(60)
+setCombatUnits("raid4")
+dispatch("UNIT_SPELLCAST_START", "raid4", "guid-gated-plain", 161399)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-gated-channel", 161399)
+runTimers()
+check("the start gate really drops a Swapblaster cast that cannot legally be happening",
+    #sentMessages == 0, messageLog())
+setCombatUnits()
+advanceClock(10)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid4", "guid-gate-open", 161399)
+runTimers()
+check("and lets the same cast through a moment later, once the caster is not fighting",
+    #sentMessages == 1, messageLog())
+restoreAlertSettings()
 
 -- ============================================================================
 -- The group's unit tokens
@@ -1305,11 +1951,11 @@ check("a Swapblaster backfire is reported as an attempt blocked by the target's 
 resetWorld()
 silenceWho("Donut")
 table.wipe(sentMessages)
-setClock(6000)
+advanceClock(60)
 dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-bf-both", 161399)
-setClock(6001)
+advanceClock(1)
 dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-bf-both", 182081)
-setClock(6002)
+advanceClock(1)
 dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid2", "guid-bf-both", 161399)
 runTimers()
 check("a backfired swap is announced once, not once per event",
@@ -1320,9 +1966,9 @@ check("a backfired swap is announced once, not once per event",
 resetWorld()
 silenceWho("Pancakes")
 table.wipe(sentMessages)
-setClock(6100)
+advanceClock(60)
 dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-cheat", 161399)
-setClock(6102)
+advanceClock(2)
 dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid2", "guid-cheat", 161399)
 runTimers()
 local cheatMsg = messageContaining("Pancakes used Swapblaster")
@@ -1337,9 +1983,9 @@ check("the call-out replaces the generic wearer note instead of doubling up",
 -- Same caster, no silencer: no accusation.
 resetWorld()
 table.wipe(sentMessages)
-setClock(6200)
+advanceClock(60)
 dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-clean", 161399)
-setClock(6202)
+advanceClock(2)
 dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid2", "guid-clean", 161399)
 runTimers()
 check("an unprotected caster gets the plain completion alert",
@@ -1710,9 +2356,9 @@ resetWorld()
 setGroup({ raid = true })
 runTimers()   -- drain, as above
 table.wipe(sentMessages)
-setClock(9000)
+advanceClock(60)
 dispatch("UNIT_SPELLCAST_CHANNEL_START", "player", "guid-me", 161399)
-setClock(9002)
+advanceClock(2)
 dispatch("UNIT_SPELLCAST_CHANNEL_STOP",  "player", "guid-me", 161399)
 runTimers()
 check("your own casts alert too - you are not partyN or raidN",
@@ -1743,6 +2389,142 @@ check("GROUP_ROSTER_UPDATE drops the cached group lists",
 
 -- A nil where the client wants a number is an error on a real client, so it is a
 -- failure here too. Without this, the harness treats SetSize(700, nil) as a shrug.
+end
+
+-- ============================================================================
+-- Source audits
+-- ============================================================================
+--
+-- The alpha.3 crash line was `name ~= ""`, and this harness cannot make that raise.
+-- Lua 5.1 consults __eq for tables only, so a value that stands in for a secret
+-- *string* has to be some other kind of value before it can have metamethods at all
+-- - which is why the stub models a secret as an unindexable table and says so in the
+-- comment above its definition. What the checks prove is what happens when the addon
+-- *uses* such a value through the APIs that accept one. What they cannot prove is
+-- that the addon never compares one with a literal, so the text is checked instead.
+--
+-- The rule is deliberately narrow: comparing anything with an empty-string literal
+-- is only ever correct about a string this addon wrote itself. A client that will not
+-- name somebody does not answer with the empty string - it answers by refusing the
+-- read, or with a value that cannot be read - so `x ~= ""` is a guess about a value
+-- the addon is not allowed to look at, wherever `x` came from the client. A line that
+-- genuinely compares something plain has to declare that on the line, where the next
+-- person reading it can see what was considered.
+
+local auditOffenders = {}
+for _, file in ipairs(files) do
+    local handle = io.open(ADDON_DIR .. "/" .. file, "r")
+    if handle then
+        local lineNo = 0
+        for rawLine in handle:lines() do
+            lineNo = lineNo + 1
+            local line = rawLine:gsub("^%s+", "")
+            -- Comments are where the rule gets explained, including in this file.
+            if not line:match("^%-%-") and not line:find("-- plain") then
+                if line:find('== ""', 1, true) or line:find('~= ""', 1, true)
+                    or line:find('"" ==', 1, true) or line:find('"" ~=', 1, true)
+                    or line:find('==""', 1, true) or line:find('~=""', 1, true) then
+                    table.insert(auditOffenders, file .. ":" .. lineNo .. ": " .. line)
+                end
+            end
+        end
+        handle:close()
+    end
+end
+check("nothing that came from the client is compared with an empty string",
+    #auditOffenders == 0, "\n  " .. table.concat(auditOffenders, "\n  "))
+
+-- The core is the only place that knows which client APIs accept a secret value and
+-- which refuse it. A module calling UnitName or C_Spell.GetSpellName directly has
+-- stepped around that one layer, which is how the crash got into a module's reach in
+-- the first place. Probe is exempt: its whole job is finding out what a given client
+-- exposes, and every read in it is guarded for exactly that reason.
+local RAW_VALUE_APIS = { "UnitName(", "UnitDisplayName(", "C_Spell.GetSpellName(",
+    "C_Spell.GetSpellInfo(", "UnitIsUnit(" }
+local apiOffenders = {}
+for _, file in ipairs(files) do
+    if file:find("^Modules/", 1, true) or file == "Commands.lua" then
+        local handle = io.open(ADDON_DIR .. "/" .. file, "r")
+        if handle then
+            local lineNo = 0
+            for rawLine in handle:lines() do
+                lineNo = lineNo + 1
+                local line = rawLine:gsub("^%s+", "")
+                if not line:match("^%-%-") then
+                    for _, api in ipairs(RAW_VALUE_APIS) do
+                        if line:find(api, 1, true) then
+                            table.insert(apiOffenders, file .. ":" .. lineNo .. ": " .. line)
+                        end
+                    end
+                end
+            end
+            handle:close()
+        end
+    end
+end
+check("no module or command reaches past the core's accessors for a client value",
+    #apiOffenders == 0, "\n  " .. table.concat(apiOffenders, "\n  "))
+
+-- A module whose declared out-of-combat policy resolves to nothing gates nothing,
+-- and alpha.3 shipped precisely that: the policy table entry was built from a global
+-- that had not been defined yet. The behaviour check above (the gate has to drop as
+-- well as allow) is the real guard; this one is what makes the mistake obvious rather
+-- than merely detectable.
+local KNOWN_POLICIES = { start = true, all = true }
+local policyOffenders = {}
+for moduleId, module in pairs(Tattle.modules) do
+    local policy = module.outOfCombat
+    if policy ~= nil and not KNOWN_POLICIES[policy] then
+        table.insert(policyOffenders, moduleId .. " asks for \"" .. tostring(policy) .. "\"")
+    end
+end
+check("every module asks for an out-of-combat policy the core implements",
+    #policyOffenders == 0, table.concat(policyOffenders, "; "))
+
+-- A developer machine runs whatever Lua Homebrew installed (this one reports 5.5.1);
+-- CI installs lua5.1, because that is the closest thing to the game's own Lua. Code
+-- that only exists in 5.2+ compiles happily here and dies in CI, on a line no review
+-- comment would catch, so the constructs themselves are audited - in the addon and in
+-- this file, which CI runs under 5.1 as well.
+local FUTURE_LUA = {
+    "//", "<<", ">>", "bit32.", "math.type(", "math.tointeger(", "math.maxinteger",
+    "math.atan(", "table.move(", "table.pack(", "table.unpack(", "utf8.", "string.pack(",
+    "warn(", "<close>", "<const>", "goto ", "::",
+}
+local luaOffenders = {}
+local ownPath = (debug.getinfo(1, "S").source or ""):gsub("^@", "")
+local toRead = { { ADDON_DIR .. "/Core.lua", "Core.lua" },
+                 { ADDON_DIR .. "/Probe.lua", "Probe.lua" },
+                 { ADDON_DIR .. "/Commands.lua", "Commands.lua" },
+                 { ADDON_DIR .. "/Modules/Swapblaster.lua", "Modules/Swapblaster.lua" },
+                 { ADDON_DIR .. "/Modules/CastSpells.lua", "Modules/CastSpells.lua" },
+                 { ADDON_DIR .. "/Modules/Silencer.lua", "Modules/Silencer.lua" },
+                 { ownPath, "Tests/wow_stub.lua" } }
+for _, source in ipairs(toRead) do
+    local handle = io.open(source[1], "r")
+    if handle then
+        local lineNo = 0
+        for rawLine in handle:lines() do
+            lineNo = lineNo + 1
+            local line = rawLine:gsub("^%s+", "")
+            if not line:match("^%-%-") then
+                -- String literals are taken out first, so a URL or a WoW colour code
+                -- is not read as an operator.
+                local code = line:gsub('".-"', '""'):gsub("'[^']*'", "''")
+                for _, token in ipairs(FUTURE_LUA) do
+                    if code:find(token, 1, true) then
+                        table.insert(luaOffenders, source[2] .. ":" .. lineNo .. ": " .. line)
+                        break
+                    end
+                end
+            end
+        end
+        handle:close()
+    end
+end
+check("nothing here needs a Lua newer than the one CI runs",
+    #luaOffenders == 0, "\n  " .. table.concat(luaOffenders, "\n  "))
+
 local geometrySeen = {}
 for _, line in ipairs(nilGeometry) do
     if not geometrySeen[line] then geometrySeen[#geometrySeen + 1] = line end
@@ -1759,6 +2541,9 @@ for key in pairs(proxied) do keys[#keys + 1] = key end
 table.sort(keys)
 realPrint("== proxied widget keys (" .. #keys .. ") ==")
 realPrint("  " .. table.concat(keys, ", "))
+
+check("no scenario rewound the client clock to make a module's record look stale",
+    #clockRewinds == 0, table.concat(clockRewinds, "; "))
 
 realPrint("== passed " .. checks.passed .. ", failed " .. checks.failed .. " ==")
 os.exit(checks.failed == 0 and 0 or 1)

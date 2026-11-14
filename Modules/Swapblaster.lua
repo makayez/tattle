@@ -49,22 +49,29 @@ local backfireNames = {}  -- populated in Initialize
 -- Built in Initialize from the name sets above.
 local isSwap, isBackfire
 
--- Cast state keyed on unitToken (a plain string, always safe).
+-- Cast state keyed on the caster. The core hands cast events a canonical group
+-- token - "player" for you whatever index the client reported you under, otherwise
+-- the group's own raidN/partyN - so one cast cannot leave two records behind under
+-- two names for the same person, and a restricted client's secret caster token
+-- never reaches a table key.
 local activeCasts = {}
 
--- How long a settled record keeps suppressing its cast's other terminal events.
--- The events for one cast arrive within a second or two of each other; anything
--- later than this from the same unit belongs to a different cast, and must not be
--- silenced by the tombstone the first one left behind.
+-- How long a record keeps describing the cast it was made for, whether that cast
+-- has settled or not. The events for one cast arrive within a second or two of
+-- each other; anything later than this from the same unit belongs to a different
+-- cast, and must not be silenced by - or described by - what the first one left
+-- behind.
 local RESOLVED_TTL = 8
 
--- A record whose cast is over and whose TTL has run out. Without this the record
--- is a permanent mute: a caster who fires twice, in a pattern where the second
--- cast's start never reaches us (out of range, a /reload mid-channel, a client
--- that reports only the completion), would be announced once ever.
+-- A record whose cast is over. Two kinds of permanent mute were possible here:
+-- the settled record outliving its usefulness (which alpha.3 fixed), and the
+-- record that was armed by a start and never terminated at all - a caster who
+-- was interrupted by an API the client does not report, a /reload mid-channel, a
+-- start with no end. That second kind suppressed every later cast from that unit
+-- forever, because its age was never asked: the check only looked at resolved
+-- records.
 local function IsStale(cast)
-    return cast.resolved and cast.resolvedAt ~= nil
-        and (GetTime() - cast.resolvedAt) > RESOLVED_TTL
+    return (GetTime() - (cast.resolvedAt or cast.startedAt)) > RESOLVED_TTL
 end
 
 -- Settles a record so the other half of the same cast cannot announce it twice.
@@ -124,9 +131,27 @@ end
 -- us as CHANNEL_START/CHANNEL_STOP, as START/SUCCEEDED, or as both. A record is
 -- armed by either start event and resolved by whichever terminal event lands
 -- first, so one cast is never announced twice.
+--
+-- What settles a cast is the record and its age, not the identity the client put on
+-- the event - and alpha.3 got that wrong twice over. A settled record only
+-- suppressed *terminal* events, so the other half of a *start* that arrived late was
+-- free to arm a second record: "CHANNEL_START, INTERRUPTED, and only then the plain
+-- START that the channeled-spell hack also sends" announced one swap twice. And
+-- comparing the client's cast identity would not have caught it either, because the
+-- plain half and the channeled half are separate client records carrying *different*
+-- GUIDs - which is as well as it is, since a restricted client hands the GUID as a
+-- secret value and will not say whether two of them match.
+--
+-- So the rule is the window a record covers. Two halves of one cast are a second or
+-- two apart; two swaps are a cooldown apart, and nobody fires this toy twice inside
+-- eight seconds. A start event that arrives while a fresh record exists belongs to
+-- the cast that record describes, whatever identity it carries. The safe side of that
+-- is one alert too few for something already announced, rather than what a player
+-- actually reported: "Malloc is casting Swapblaster" and "Malloc's Swapblaster was
+-- interupted", each of them twice, for one swap.
 local function ArmCast(unitToken, channelled)
     local existing = activeCasts[unitToken]
-    if existing and not existing.resolved then return nil end
+    if existing and not IsStale(existing) then return nil end
 
     activeCasts[unitToken] = {
         -- Recorded now, on purpose: every alert this cast produces describes the
@@ -145,9 +170,11 @@ local function ArmCast(unitToken, channelled)
     return activeCasts[unitToken]
 end
 
--- Claims a cast for a terminal event. Returns nil when that cast has already
--- been reported. A cast with no record at all still gets claimed so a spell we
--- only ever see the completion of is not dropped.
+-- Claims a cast for a terminal event: SUCCESS, CHANNEL_STOP, FAILED or
+-- INTERRUPTED. Returns nil when that cast has already been reported by its other
+-- half. A cast with no record at all still gets claimed, so a swap your client
+-- only ever saw the end of - a start cast on somebody out of range, a start the
+-- client never sent - is not dropped.
 local function ClaimCast(unitToken)
     local cast = activeCasts[unitToken]
     if cast and not IsStale(cast) then
@@ -208,8 +235,6 @@ end
 -- but a backfire can only be caused by a protected player, so the group's
 -- Neural Silencer wearers are the candidate list.
 local function HandleBackfire(unitToken, sourceName)
-    if not sourceName then return end
-
     -- Whichever half of the cast we hear about last must not announce it twice --
     -- unless the record is a stale one, in which case this backfire belongs to a
     -- later cast and deserves its own alert.
@@ -241,6 +266,10 @@ end
 -- about the victim when it was not -- they never guess, and never claim the swap
 -- landed on somebody the caster was not looking at.
 local function OnEvent(event, unitToken, castGUID, spellID, spellName)
+    -- `castGUID` is received and deliberately unused. See Cast bookkeeping above for
+    -- why the window a record covers, rather than the identity the client put on the
+    -- event, is what decides whether this is a cast already announced.
+    --
     -- A guard, not the primary filter: the dispatcher has already dropped casts
     -- by anyone who is not one of your group's players. It stays because that
     -- filter is per-event, and another module's `allCasters` flag would widen the
@@ -250,7 +279,7 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
     local backfire = isBackfire(spellName, spellID)
     if not backfire and not isSwap(spellName, spellID) then return end
 
-    local sourceName = Tattle.GetUnitShortName(unitToken)
+    local sourceName = Tattle.CasterLabel(unitToken)
 
     -- The backfire is a different spell from the cast, so it is settled here,
     -- before the scope filter that governs the cast itself: it is worth reporting
@@ -285,9 +314,8 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         Tattle.DebugPrint("Swapblaster SUCCESS:", sourceName)
 
     elseif event == "UNIT_SPELLCAST_CHANNEL_STOP" then
-        local cast = activeCasts[unitToken]
-        if not cast or (cast.resolved and not IsStale(cast)) then return end
-        Resolve(cast)
+        local cast = ClaimCast(unitToken)
+        if not cast then return end
 
         local finished = FinishedAsExpected(cast)
 
@@ -307,9 +335,8 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         Tattle.DebugPrint("Swapblaster CHANNEL_STOP:", sourceName, finished)
 
     elseif event == "UNIT_SPELLCAST_FAILED" then
-        local cast = activeCasts[unitToken]
-        if not cast or (cast.resolved and not IsStale(cast)) then return end
-        Resolve(cast)
+        local cast = ClaimCast(unitToken)
+        if not cast then return end
 
         local note = SilencerNote(cast.wearers)
         Tattle.SendAlert(string_format("%s's Swapblaster%s failed%s",
@@ -317,9 +344,8 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         Tattle.DebugPrint("Swapblaster FAILED:", sourceName, note)
 
     elseif event == "UNIT_SPELLCAST_INTERRUPTED" then
-        local cast = activeCasts[unitToken]
-        if not cast or (cast.resolved and not IsStale(cast)) then return end
-        Resolve(cast)
+        local cast = ClaimCast(unitToken)
+        if not cast then return end
 
         Tattle.SendAlert(string_format("%s's Swapblaster%s was interrupted",
             sourceName, OnPhrase(cast)), MODULE_ID)

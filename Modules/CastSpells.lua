@@ -32,7 +32,18 @@ local function MakeGripModule(spec)
     local MODULE_ID    = spec.id
     local names        = {}   -- spell names, filled at initialize
     local isOurCast            -- matcher built at initialize
-    local armedCasts = {}     -- unitToken -> true, for a START awaiting its outcome
+    local armedCasts = {}     -- unitToken -> GetTime(), for a START awaiting its outcome
+
+    -- A START that never got an outcome is not a promise about the next cast from
+    -- that unit. Without an expiry, one FAILED cast that the client reported as a
+    -- start and nothing else left the unit armed for the rest of the run, and any
+    -- later INTERRUPTED - of a different cast entirely - was announced as this one.
+    local ARM_TTL = 8
+
+    local function IsArmed(unitToken)
+        local armedAt = armedCasts[unitToken]
+        return armedAt ~= nil and (GetTime() - armedAt) <= ARM_TTL
+    end
 
     -- The cast leaves an aura on whoever was picked up and on nobody else, so the
     -- carriers of the cast's own spell name are the passengers -- minus the caster,
@@ -50,8 +61,7 @@ local function MakeGripModule(spec)
         if not Tattle.IsGroupMemberToken(unitToken) then return end
         if not isOurCast(spellName, spellID) then return end
 
-        local sourceName = Tattle.GetUnitShortName(unitToken)
-        if not sourceName then return end
+        local sourceName = Tattle.CasterLabel(unitToken)
 
         local action = spec.action
 
@@ -63,7 +73,7 @@ local function MakeGripModule(spec)
             -- reason to stay quiet.
             if Tattle.ScopeDrops(MODULE_ID, unitToken, nil) then return end
 
-            armedCasts[unitToken] = true
+            armedCasts[unitToken] = GetTime()
             Tattle.SendAlert(string_format("%s is casting %s (out of combat)!", sourceName, action), MODULE_ID)
             Tattle.DebugPrint(action, "START (out of combat):", sourceName)
 
@@ -105,7 +115,7 @@ local function MakeGripModule(spec)
             end
 
         elseif event == "UNIT_SPELLCAST_FAILED" then
-            if not armedCasts[unitToken] then return end
+            if not IsArmed(unitToken) then return end
             armedCasts[unitToken] = nil
             -- A grab can fail for plenty of reasons, so this states who is immune
             -- rather than blaming them for the failure.
@@ -114,7 +124,7 @@ local function MakeGripModule(spec)
             Tattle.DebugPrint(action, "FAILED:", sourceName)
 
         else  -- UNIT_SPELLCAST_INTERRUPTED
-            if not armedCasts[unitToken] then return end
+            if not IsArmed(unitToken) then return end
             armedCasts[unitToken] = nil
             Tattle.SendAlert(string_format("%s's %s was interrupted.", sourceName, action), MODULE_ID)
             Tattle.DebugPrint(action, "INTERRUPTED:", sourceName)

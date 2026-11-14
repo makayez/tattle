@@ -7,11 +7,15 @@ local _, Tattle = ...
 local print = print
 local string_format = string.format
 local table_concat = table.concat
+local table_sort = table.sort
 
 local function HandleSlashCommand(msg)
     msg = (msg or ""):lower():trim()
 
-    if msg == "" then
+    -- `msg` is whatever the player typed in the chat box, lowercased and trimmed by
+    -- the line above: a string this file wrote, not a value the client handed over,
+    -- so comparing it with a literal is an ordinary thing to do.
+    if msg == "" then   -- plain
         if Tattle.Config then Tattle.Config:Toggle() end
 
     elseif msg == "version" then
@@ -70,6 +74,23 @@ local function HandleSlashCommand(msg)
             print("  Watch list:", display.showList
                 and ("ON (" .. (sections[1] and table_concat(sections, ", ") or "no sections") .. ")")
                 or "OFF")
+        end
+
+        -- Everything the addon swallowed since it started: a module that threw on a
+        -- cast event, a cast the client would not let it classify, a name it was not
+        -- allowed to read. The first of each kind was printed in chat as it happened;
+        -- this is how you find out after you noticed something was not being said,
+        -- which is the order it actually happens in.
+        local problems = Tattle.SessionProblems()
+        local kinds = {}
+        for kind in pairs(problems) do kinds[#kinds + 1] = kind end
+        if kinds[1] then
+            table_sort(kinds)
+            print("Problems this session:")
+            for _, kind in ipairs(kinds) do
+                local problem = problems[kind]
+                print(string_format("  %s  x%d  (%s)", kind, problem.count, problem.detail))
+            end
         end
 
     else

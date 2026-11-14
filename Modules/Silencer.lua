@@ -251,7 +251,11 @@ function Silencer:ApplyVisibility()
     end
 
     local text = watchFrame.text:GetText()
-    if text and text ~= "" then watchFrame:Show() else watchFrame:Hide() end
+    -- GetText returns what this module put into that font string a moment ago, not a
+    -- name the client was asked for, so emptiness is a fact about a string this file
+    -- owns. The audit in the harness cannot tell the two apart from the text alone,
+    -- which is why the exemption has to be stated here rather than assumed there.
+    if text and text ~= "" then watchFrame:Show() else watchFrame:Hide() end   -- plain
 end
 
 -- Returns true when the text actually changed. The caller uses that to decide
@@ -398,7 +402,13 @@ local function OnEvent(event, unitToken)
 
     -- Your own aura counts for the wearer list; your own target does not count
     -- for the watcher list (WatcherNames only ever matches other members).
-    if unitToken ~= "player" and not Tattle.IsGroupMemberToken(unitToken) then return end
+    --
+    -- There is no `unitToken ~= "player"` shortcut here any more: it compares a
+    -- token this module did not build, and a restricted client hands one of those
+    -- in as a secret value the addon is not allowed to compare. IsGroupMemberToken
+    -- already answers "is this you" through UnitIsUnit, which accepts a secret
+    -- operand.
+    if not Tattle.IsGroupMemberToken(unitToken) then return end
 
     local settings = GetSettings()
     if not settings then return end

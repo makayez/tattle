@@ -30,7 +30,6 @@ local UnitInRaid = UnitInRaid
 local UnitInParty = UnitInParty
 local UnitIsUnit = UnitIsUnit
 local UnitName = UnitName
-local UnitExists = UnitExists
 local UnitAffectingCombat = UnitAffectingCombat
 local GetNumGroupMembers = GetNumGroupMembers
 local SendChatMessage = SendChatMessage
@@ -43,6 +42,114 @@ local UIParent = UIParent
 local pcall = pcall
 
 -- ============================================================================
+-- Utility
+-- ============================================================================
+--
+-- Declared at the top because the registration path below reports through it, and a
+-- Lua local is only visible to functions written after it.
+
+local function DebugPrint(...)
+    if TattleDB and TattleDB.debug then
+        print("|cff00ff00[Tattle Debug]|r", ...)
+    end
+end
+Tattle.DebugPrint = DebugPrint
+
+-- ============================================================================
+-- Restricted Values
+-- ============================================================================
+--
+-- In restricted content (M+, rated PvP) the client hands cast events *secret*
+-- values: the spell ID, any name derived from that ID, the unit name behind a
+-- secret unit, and on some builds the unit token itself. A secret value may only
+-- be handed to an API documented to accept one. Comparing it - with a literal,
+-- with another secret, or with itself - concatenating it, indexing a table with
+-- it, or printing it all raise:
+--
+--   attempt to compare local 'name' (a secret string value, while execution
+--   tainted by 'Tattle')
+--
+-- `type()` is no help: a secret string still reports "string". That is provable
+-- from the alpha.3 crash, which happened at `name ~= ""` - a line only reachable
+-- after `type(name) == "string"` had already answered true. So nothing in this
+-- addon may inspect a value that came from a restricted event. The rules:
+--
+--   1. Ask the client rather than the value. `UnitIsUnit` accepts a secret token
+--      and answers with a plain boolean, so a secret token can be resolved to
+--      whichever plain `player`/`partyN`/`raidN` token this addon built itself
+--      (GroupSlotOf), and every table keyed on a caster keys on that.
+--   2. Attempt the operation under pcall and treat a refusal as its own answer.
+--      These helpers return nil for "the client would not say", which callers
+--      must never read as "no" - same convention as ScopeDrops.
+--   3. Where a name has to be matched against our own list and the name is
+--      secret, use the client's sanctioned comparison API if this build has one.
+
+-- Present in a 11.0.7+ client; absent in older ones, where the question simply
+-- cannot be asked.
+local secretEqual = (C_SecretComparisons and C_SecretComparisons.Equal) or nil
+
+-- Asking "is this secret?" is itself a comparison, so the probe is the smallest
+-- one possible: a plain value is equal to itself, and the client raises when a
+-- secret value is compared at all. Nothing else about the value is looked at - not
+-- its truthiness, not its length, not its type beyond what type() reports (and
+-- type() reports "string" for a secret string, which is the trap).
+local function SelfCompare(value) return value == value end
+
+local function IsSecretValue(value)
+    local kind = type(value)
+    if kind ~= "string" and kind ~= "number" then return false end
+    return not pcall(SelfCompare, value)
+end
+Tattle.IsSecretValue = IsSecretValue
+
+-- The value, when it is safe to print, concatenate, or use as a key; nil when it
+-- is not. A name this addon cannot read is a name it must not half-use.
+local function PlainText(value)
+    if type(value) ~= "string" then return nil end
+    if not pcall(SelfCompare, value) then return nil end
+    return value
+end
+Tattle.PlainText = PlainText
+
+-- nameSet[name] == true, attempted rather than assumed: indexing a table with a
+-- secret key is a refusal, not a miss.
+local function LookupInNameSet(nameSet, name) return nameSet[name] == true end
+
+-- "Is this secret spell name one of ours?" asked through the client, which is the
+-- only side allowed to compare a secret value. Both argument orders are tried
+-- because the sanctioned API is not documented as caring which side is which.
+-- true/false when this build answered, nil when it would not answer at all.
+local function SecretNameMatches(nameSet, secretName)
+    if not secretEqual then return nil end
+    local answered = false
+    for watched in pairs(nameSet) do
+        local ok, same = pcall(secretEqual, secretName, watched)
+        if not ok then ok, same = pcall(secretEqual, watched, secretName) end
+        if ok and type(same) == "boolean" then
+            answered = true
+            if same then return true end
+        end
+    end
+    return answered and false or nil
+end
+
+-- "Is this name in nameSet?" - true/false when answered, nil when the client
+-- refused, which is neither yes nor no.
+--
+-- A string is tried as a key first, under pcall, because on a client that is not
+-- restricted that is the whole answer and it costs one index. A secret string is a
+-- refusal rather than a miss; a value that is not a string at all is not a key this
+-- addon may use either way. Both end at the same place: ask the client.
+local function NameMatches(nameSet, name)
+    if type(name) == "string" then
+        local ok, hit = pcall(LookupInNameSet, nameSet, name)
+        if ok then return hit == true end
+    end
+    return SecretNameMatches(nameSet, name)
+end
+Tattle.NameMatches = NameMatches
+
+-- ============================================================================
 -- The Event Frame
 -- ============================================================================
 --
@@ -53,6 +160,16 @@ local pcall = pcall
 -- GROUP_ROSTER_UPDATE is registered here rather than left to the modules
 -- because the core caches the group's unit tokens and has to drop them whether
 -- or not any module wants them.
+
+-- The two events that *begin* a cast. The core's `outOfCombat = "start"` policy
+-- is judged against this set, so it has to name both families a cast can start
+-- with: a plain cast sends UNIT_SPELLCAST_START, a channeled one (Swap is flagged
+-- channeled) sends UNIT_SPELLCAST_CHANNEL_START. Listing only the first is how
+-- the Swapblaster's gate silently gated nothing.
+local CAST_START_EVENTS = {
+    UNIT_SPELLCAST_START         = true,
+    UNIT_SPELLCAST_CHANNEL_START = true,
+}
 
 local CAST_EVENTS = {
     UNIT_SPELLCAST_START          = true,
@@ -132,17 +249,28 @@ local function RebuildModuleListeners()
     table_wipe(eventAcceptsAnyCaster)
     for _, moduleId in ipairs(Tattle.moduleOrder) do
         local module = Tattle.modules[moduleId]
+        -- One entry per event per module. A module whose event list repeats an event
+        -- is a duplicate alert waiting to happen - the dispatcher would wake it twice
+        -- for one cast - and "two Swapblaster alerts per swap" is exactly the kind of
+        -- report a repeated entry in that list produces. Dropped here so the mistake
+        -- cannot reach a player, and said out loud in debug so it is not invisible.
+        local seen = {}
         for _, ev in ipairs(module.events) do
-            local listeners = moduleEvents[ev]
-            if not listeners then
-                listeners = {}
-                moduleEvents[ev] = listeners
-            end
-            listeners[#listeners + 1] = moduleId
-            -- One module opting out lifts the caster filter for the whole event,
-            -- because the filter runs before the listeners are consulted.
-            if CAST_EVENTS[ev] and module.allCasters then
-                eventAcceptsAnyCaster[ev] = true
+            if not seen[ev] then
+                seen[ev] = true
+                local listeners = moduleEvents[ev]
+                if not listeners then
+                    listeners = {}
+                    moduleEvents[ev] = listeners
+                end
+                listeners[#listeners + 1] = moduleId
+                -- One module opting out lifts the caster filter for the whole event,
+                -- because the filter runs before the listeners are consulted.
+                if CAST_EVENTS[ev] and module.allCasters then
+                    eventAcceptsAnyCaster[ev] = true
+                end
+            else
+                DebugPrint("module", moduleId, "listed", ev, "twice - registered once")
             end
         end
     end
@@ -261,15 +389,33 @@ InitializeModuleSettings = function(moduleId)
 end
 
 -- ============================================================================
--- Utility
+-- Problems worth telling the user about
 -- ============================================================================
+--
+-- A restricted-context refusal is invisible by design in a running game: it is
+-- the client declining an API call, not the addon doing something loud. That is
+-- also why "Tattle went quiet in my M+ run" was undiagnosable - every module
+-- error was being printed only when /tattle debug happened to be on. Each kind
+-- of swallowed problem is counted, announced once, and listed by /tattle status.
 
-local function DebugPrint(...)
-    if TattleDB and TattleDB.debug then
-        print("|cff00ff00[Tattle Debug]|r", ...)
+local sessionProblems = {}     -- kind -> { count = n, detail = "first one seen" }
+
+function Tattle.ReportProblem(kind, detail)
+    local problem = sessionProblems[kind]
+    if problem then
+        problem.count = problem.count + 1
+    else
+        sessionProblems[kind] = { count = 1, detail = detail }
+        print(string_format("Tattle: %s (%s) - later ones are counted by /tattle status",
+            kind, tostring(detail)))
     end
+    DebugPrint("problem:", kind, detail)
 end
-Tattle.DebugPrint = DebugPrint
+
+
+function Tattle.SessionProblems()
+    return sessionProblems
+end
 
 -- Group guard. These abilities can only be used on someone you are grouped
 -- with, so party and raid both matter -- a raid-only gate is silent for the
@@ -281,7 +427,10 @@ local function IsGrouped()
 end
 Tattle.IsGrouped = IsGrouped
 
--- Returns short name (no realm) for a unit token.
+-- Returns short name (no realm) for a unit token, or nil when the client will not
+-- name them. In restricted content UnitName answers for a group member with a
+-- secret value, and `type()` still calls that a string - so the read is not enough,
+-- the answer has to be proved printable before a string method touches it.
 local function GetUnitShortName(unitToken)
     if not unitToken then return nil end
     -- pcall'd because the tokens handed to this are not always plain group
@@ -289,7 +438,9 @@ local function GetUnitShortName(unitToken)
     -- client synced it, and a restricted context refuses the read rather than
     -- returning nil.
     local ok, fullName = pcall(UnitName, unitToken)
-    if not ok or not fullName then return nil end
+    if not ok then return nil end
+    fullName = PlainText(fullName)
+    if not fullName then return nil end
     return fullName:match("^([^-]+)") or fullName
 end
 Tattle.GetUnitShortName = GetUnitShortName
@@ -336,9 +487,12 @@ Tattle.IsSameUnit = IsSameUnit
 -- Evoker came to be reported as their own Rescue passenger. It is pcall'd for the
 -- same reason as above: comparing units is the cheap way to touch a restricted
 -- token, and a refusal means "not provably you", which is the safe answer.
+--
+-- There is deliberately no `unitToken == "player"` shortcut. It was a fast path for
+-- the common case and a crash for the restricted case, and UnitIsUnit("player",
+-- "player") is already true.
 local function IsYou(unitToken)
     if not unitToken then return false end
-    if unitToken == "player" then return true end
     return IsSameUnit(unitToken, "player")
 end
 Tattle.IsYou = IsYou
@@ -401,6 +555,37 @@ local function GroupUnitTokens()
 end
 Tattle.GroupUnitTokens = GroupUnitTokens
 
+-- Which member of your group an event's caster token names, answered as a plain
+-- token this addon built itself: "player" for you (whatever index the client used
+-- to report you), otherwise the group's own "raidN"/"partyN". nil means "not a
+-- member of your group", which includes pets, totems and NPCs.
+--
+-- Two separate problems, one answer:
+--
+--   * A restricted client can hand the caster in as a secret value. Every token a
+--     module keys on, and every `<unit>target` string built from it, has to be
+--     plain for the addon to store or print it. This is the only way to turn a
+--     secret token into a plain one: the client answers UnitIsUnit for a secret
+--     operand, and the token that comes back is one of ours.
+--   * A client that reports you as your own raidN index reports the same cast
+--     under a second token as well. Keying bookkeeping on whatever the event
+--     carried means two records for one cast, and each record gets to announce
+--     itself. Collapsing to one canonical token means one record.
+--
+-- Cost is at most one UnitIsUnit per group member, so callers ask only after the
+-- spell name has already matched something worth announcing -- a handful of times
+-- per fight, not per cast the raid produces.
+local function GroupSlotOf(unitToken)
+    if not unitToken then return nil end
+    if IsYou(unitToken) then return "player" end
+    for _, token in ipairs(GroupUnitTokens()) do
+        -- "player" was the answer above; the rest are this addon's own strings.
+        if token ~= "player" and IsSameUnit(unitToken, token) then return token end
+    end
+    return nil
+end
+Tattle.GroupSlotOf = GroupSlotOf
+
 -- { owner = "raid1", target = "raid1target" } for every group member (you are
 -- not included: nobody needs to watch their own target list).
 --
@@ -450,9 +635,27 @@ Tattle.GroupTargetEntries = GroupTargetEntries
 -- UnitIsUnit per group member, which is twenty-odd calls in a raid; on a client
 -- that was never told the target, or with a caster who has none, one UnitExists
 -- answers the question and the loop never runs.
+
+-- `<unit>target`, built without touching anything the client is not allowed to let
+-- us touch. Concatenation is *attempted*: the plain token of the ordinary case
+-- costs one string operation and no unit queries at all, and only when the client
+-- refuses - which is what a secret token does - does this pay to resolve the
+-- caster into one of this addon's own plain tokens, which is also the only way to
+-- get a target token at all, since a secret value cannot be concatenated.
+local function AppendSuffix(value, suffix) return value .. suffix end
+
+local function TargetTokenOf(unitToken)
+    local ok, token = pcall(AppendSuffix, unitToken, "target")
+    if ok and type(token) == "string" then return token end
+    local slot = GroupSlotOf(unitToken)
+    if not slot then return nil end
+    return slot .. "target"
+end
+
 local function GroupMemberTargetOf(unitToken)
     if not unitToken then return nil end
-    local targetToken = unitToken .. "target"
+    local targetToken = TargetTokenOf(unitToken)
+    if not targetToken then return nil end
 
     local ok, exists = pcall(UnitExists, targetToken)
     if not (ok and exists) then return nil end
@@ -542,6 +745,18 @@ local function UnitDisplayName(unitToken)
     return GetUnitShortName(unitToken)
 end
 Tattle.UnitDisplayName = UnitDisplayName
+
+-- The word an alert uses for whoever cast something: their name, or "someone"
+-- when the client will not name them. Not UnitDisplayName - an alert about your own
+-- cast names you the way it names anybody else, and "you" is reserved for the side
+-- of the move being described. The fallback is what restricted content needs: there
+-- UnitName answers with a secret value this addon may not print, and a cast that is
+-- really happening should still be reported rather than swallowed because the
+-- client would not say who fired it.
+local function CasterLabel(unitToken)
+    return GetUnitShortName(unitToken) or "someone"
+end
+Tattle.CasterLabel = CasterLabel
 
 -- "you" / "Donut" / "Donut and Pancakes", for the "used X on Y" alerts.
 local function TargetPhrase(carrierTokens)
@@ -758,25 +973,42 @@ local watchedSpellNames = {}   -- spell name -> true
 -- decides which of its own spells it is looking at.
 local function WatchSpellNames(nameSet)
     for name in pairs(nameSet or {}) do
-        if type(name) == "string" then watchedSpellNames[name] = true end
+        -- Only plain names can be stored as keys, and every name a module builds
+        -- from its own public spell IDs is plain. A name that is not is reported
+        -- rather than stored, because a secret key would raise here.
+        local plain = PlainText(name)
+        if plain then watchedSpellNames[plain] = true end
     end
 end
 Tattle.WatchSpellNames = WatchSpellNames
 
-local function ResolveSpellName(spellID)
-    if spellID == nil then return nil end
+-- The name a spell ID reports, exactly as the client reports it -- which in
+-- restricted content means a *secret* name, safe to hand to another API and not safe
+-- to inspect. Nothing here may look at the answer: no `~= ""`, no `#name`, no
+-- tostring, and no filtering it down to "a string we can see", because dropping a
+-- name the matcher could still have asked about is how the feature goes silent in
+-- the exact content the feature is for. Whether the name may be used is the
+-- matcher's question, asked in NameMatches.
+local function FieldOf(object, key) return object[key] end
 
-    -- A plain string with no table to allocate; GetSpellInfo is the fallback for
-    -- a client without it. Both accept a secret spell ID and hand back a plain
-    -- name, which is the only value we ever compare or store.
+local function ResolveSpellName(spellID)
+    if type(spellID) == "nil" then return nil end
+
+    -- A plain string with no table to allocate; GetSpellInfo is the fallback for a
+    -- client without it. Both accept a secret spell ID and hand back a name, and a
+    -- name derived from a secret ID is itself secret.
     if C_Spell and C_Spell.GetSpellName then
         local ok, name = pcall(C_Spell.GetSpellName, spellID)
-        if ok and type(name) == "string" and name ~= "" then return name end
+        if ok and type(name) ~= "nil" then return name end
     end
     if C_Spell and C_Spell.GetSpellInfo then
         local ok, info = pcall(C_Spell.GetSpellInfo, spellID)
-        if ok and info and type(info.name) == "string" and info.name ~= "" then
-            return info.name
+        if ok and type(info) ~= "nil" then
+            -- Reading the field is an index into the table the client handed back,
+            -- which is allowed; the *value* in it may still be secret, which the
+            -- matcher below has to be ready for.
+            local ok2, name = pcall(FieldOf, info, "name")
+            if ok2 and type(name) ~= "nil" then return name end
         end
     end
     return nil
@@ -803,16 +1035,23 @@ end
 
 -- Fill nameSet with the names this client reports for spellIDs, and register
 -- them so the dispatcher wakes this module for them. Comparing names rather than
--- IDs is what survives a spell being renumbered by a patch, and it is also the
--- only comparison that is safe on a spell ID that arrived as a secret value.
+-- IDs is what survives a spell being renumbered by a patch -- but it only works
+-- when both sides can be compared, which is what the matching below is for.
 -- An ID the client does not know is named in the debug log instead of being
 -- silently unwatched.
 function Tattle.ResolveSpellNames(nameSet, spellIDs)
     for _, id in ipairs(spellIDs or {}) do
         local name = ResolveSpellName(id)
-        if name then
-            nameSet[name] = true
-            DebugPrint("  watching", name, "(" .. tostring(id) .. ")")
+        local plain = PlainText(name)
+        if plain then
+            nameSet[plain] = true
+            DebugPrint("  watching", plain, "(" .. tostring(id) .. ")")
+        elseif name then
+            -- A name this addon cannot store as a key is a spell it cannot watch
+            -- by name. Loud, because it means a shipped spell ID stopped being a
+            -- plain value and every alert for it is dead.
+            Tattle.ReportProblem("a spell name could not be read from spell ID " .. tostring(id),
+                "the client returned a value this addon is not allowed to store")
         else
             DebugPrint("  WARNING: spell ID", id, "is not in this client's spell database")
         end
@@ -824,12 +1063,17 @@ end
 -- A predicate answering "is this cast one of mine?", using the name the
 -- dispatcher already resolved when it has one and falling back to the ID when it
 -- does not. Built once, at initialize, so no module re-walks its own list.
+-- Secret-safe: the name is matched by indexing when it is plain and through the
+-- client when it is not.
 function Tattle.MakeSpellMatcher(nameSet)
     return function(spellName, spellID)
-        if spellName then return nameSet[spellName] == true end
+        local hit = NameMatches(nameSet, spellName)
+        if hit ~= nil then return hit end
         if not spellID then return false end
-        local name = ResolveSpellName(spellID)
-        return (name ~= nil) and (nameSet[name] == true)
+        -- An unanswered question answers false here, which is the right place for
+        -- it: the dispatcher is what reports the refusal, so a module never has to
+        -- tell "not ours" apart from "not allowed to say".
+        return NameMatches(nameSet, ResolveSpellName(spellID)) == true
     end
 end
 
@@ -925,7 +1169,12 @@ local addonReady = false
 local function CallModule(module, moduleId, event, ...)
     local ok, err = pcall(module.onEvent, event, ...)
     if not ok then
-        DebugPrint(string_format("Error in module %s: %s", moduleId, err))
+        -- Reported rather than debug-printed. Until now a module that threw on
+        -- every single cast was indistinguishable from a module with nothing to
+        -- say, because the error only reached chat when /tattle debug happened to
+        -- be on -- which is exactly how "no Swapblaster alerts in my M+ key" was
+        -- readable as "the gate decided not to fire".
+        Tattle.ReportProblem(string_format("module %s failed on %s", moduleId, event), err)
     end
 end
 
@@ -986,12 +1235,35 @@ Tattle.eventFrame:SetScript("OnEvent", function(_, event, ...)
     -- cheaper-looking order widens what can throw, on the busiest path there is,
     -- and a throw here silences the addon for the remainder of the event.
     local arg1, arg2, arg3 = ...
-    local spellName
+    local casterToken, spellName
     if CAST_EVENTS[event] then
         if not eventAcceptsAnyCaster[event] and not IsGroupMemberToken(arg1) then return end
         spellName = ResolveSpellName(arg3)
-        if not spellName or not watchedSpellNames[spellName] then return end
+        -- Asked through type() rather than `if not spellName`, because testing a
+        -- secret value for truthiness is itself an operation on it. An ID this client
+        -- has no name for is ordinary - a hidden spell, a cast from a toy Tattle does
+        -- not follow - and is dropped without a word.
+        if type(spellName) == "nil" then return end
+        local matched = NameMatches(watchedSpellNames, spellName)
+        if matched == nil then
+            -- The client named the cast and then refused to say whether it was one
+            -- of ours: the name descends from a secret spell ID, and this build has
+            -- no comparison API to ask with. That silence is the addon being denied,
+            -- not the addon deciding, and a player cannot tell the two apart without
+            -- being told. It is reported once and counted after that.
+            Tattle.ReportProblem(
+                "the client would not say whether a cast was one Tattle watches",
+                "restricted content on this build, and C_SecretComparisons is unavailable")
+            return
+        end
+        if not matched then return end
+        -- Only now, for a cast worth announcing, is the caster resolved to one of
+        -- this addon's own tokens: it turns a secret caster into a printable, storable
+        -- key, and folds the two tokens a raid client can report one cast under into
+        -- a single identity for the modules' per-cast bookkeeping.
+        casterToken = GroupSlotOf(arg1) or arg1
     end
+    local dispatchToken = casterToken or arg1
 
     local listeners = moduleEvents[event]
     if not listeners then return end
@@ -1015,14 +1287,14 @@ Tattle.eventFrame:SetScript("OnEvent", function(_, event, ...)
                 local gate = module.outOfCombat and OUT_OF_COMBAT_EVENTS[module.outOfCombat]
                 local drop = (gate ~= nil) and (gate[event] == true)
                 if drop then
-                    if casterInCombat == nil then casterInCombat = UnitInCombat(arg1) end
+                    if casterInCombat == nil then casterInCombat = UnitInCombat(dispatchToken) end
                     drop = casterInCombat
                 end
 
                 if drop then
                     DebugPrint("Skipping", moduleId, "- its caster is in combat")
                 else
-                    CallModule(module, moduleId, event, arg1, arg2, arg3, spellName)
+                    CallModule(module, moduleId, event, dispatchToken, arg2, arg3, spellName)
                 end
             end
         end
