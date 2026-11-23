@@ -86,7 +86,9 @@ local SCOPE_OPTIONS = {
 -- Looking for Raid group instead of vanishing. "Instance" asks for that resolved
 -- channel directly.
 local CHAT_TYPE_OPTIONS = {
-    {text = "Private (console only)", value = "PRIVATE"},
+    -- Called "None" rather than "console only", because with debug off and
+    -- that module's Console output unticked it really does send nothing anywhere.
+    {text = "None (no chat message)", value = "PRIVATE"},
     {text = "Say",       value = "SAY"},
     {text = "Yell",      value = "YELL"},
     {text = "Party",     value = "PARTY"},
@@ -611,7 +613,7 @@ local function AddScopeControl(container, moduleSettings, y)
 end
 
 local function AddAlertControls(container, alerts, y)
-    AddCheckbox(container, y, "Console output",
+    AddCheckbox(container, y, "Console output (also on with /tattle debug)",
         function() return alerts.console end,
         function(value) alerts.console = value end)
     y = y - CHECKBOX_ROW
@@ -830,7 +832,19 @@ function Config:RegisterInterfaceOptions()
     openBtn:SetText("Open Configuration")
     openBtn:SetScript("OnClick", function()
         Config:Show()
-        Settings.Close()
+        -- Close the settings frame the *client* owns, if this client says how.
+        -- `Settings.Close` was assumed, and on the client a beta was run on it is
+        -- not there: the click opened Tattle's panel and then threw
+        -- `Config.lua:833: attempt to call a nil value`, which is the worst shape
+        -- of this bug because the button worked. Whether the client owns that
+        -- method is the client's business, so it is asked for rather than
+        -- assumed, with the frame itself as the fallback.
+        local close = Settings and Settings.Close
+        if type(close) == "function" then
+            close(Settings)
+        elseif SettingsPanel and type(SettingsPanel.Hide) == "function" then
+            SettingsPanel:Hide()
+        end
     end)
 
     local slashInfo = settingsPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
