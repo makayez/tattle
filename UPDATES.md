@@ -1,5 +1,33 @@
 # Recent Updates
 
+### Two betas later: what a name in an alert is worth
+**Before**: `Donut used Swapblaster on Pancakes`, where Pancakes was whoever the caster's
+target frame pointed at when the cast began. The entry below in this file described that as
+the design. It was a guess wearing evidence: a `@mouseover` macro leaves that frame sitting
+on whoever the caster last clicked, and the alert printed that member as the victim of a
+swap that never touched them
+
+**Now**: the alert says the thing the evidence supports. A name from the client's own
+cast-target APIs is named as whom the spell landed on - `used Swapblaster on Maple`. A name
+from the caster's interface is named as where they were aiming - `used Swapblaster - aiming
+at Pancakes`. Nothing answering says neither. A name the client keeps as a secret value is
+asked back through the client's own comparison rather than thrown away, and a name that
+belongs to nobody in your group stays unresolved. Every sentence about a cast that did not
+land uses the aiming wording whatever the evidence, because a cast that arrived nowhere
+arrived on nobody
+
+**Also fixed**: a Neural Silencer aura read that the client *refused* could be counted as a
+member who is protected, so the watch list could name someone as protected on the strength
+of a value the client forbade this addon to look at. It now says `Unknown (+2 hidden by the
+client)`, and an empty group and a refused group are two different sentences
+
+**What that found**: two client APIs were looked up once at load time, which no test could
+exercise an absence of, so the "what if this build doesn't have it" guards had quietly
+become comments. Everything is asked for at the moment it is called now, and there is a
+harness section that takes each API away in turn and runs the same alerts - 240 checks
+became 264, and every new one was mutation-tested
+
+
 ### The swap finally says who it was aimed at
 **Before**: `Donut used Swapblaster`. Every doc said the victim cannot be named,
 because the toy marks nobody and 12.0.0 deleted the one API that reported a spell's

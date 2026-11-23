@@ -2,7 +2,7 @@
 
 All notable changes to Tattle will be documented in this file.
 
-## [Unreleased]
+## [0.2.0-beta.3] - 2026-11-23
 
 ### Fixed
 
