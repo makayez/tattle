@@ -40,11 +40,15 @@ Before testing anything else, see what your client actually exposes:
 Then use each ability on **yourself** and on **a friend**. The probe prints, for every cast event it sees (at most once a second for the group context lines, and **nothing at all while you are solo** - none of this can happen without a group):
 
 - the spell name (resolved through `C_Spell.GetSpellInfo`, so it works even when the ID is a secret value)
+- the whole event payload, argument by argument, so a claim about what your client exposes can be checked against what it actually sent
 - whether the caster argument can be named, and whether it is you
-- whether any destination argument is exposed at all
+- whether the destination is exposed - and `UNIT_SPELLCAST_SENT` is read by its own layout, where the destination is **argument 2** and the spell ID is **argument 4**. An earlier revision of the probe looked for the spell in argument 3 and hunted the destination in arguments 4-6, and printed `none exposed` about payloads that carried both, so anything it told you about target visibility was a statement about its own indexing
 - which group auras are currently visible
 - the group's Neural Silencer wearers
 - what each group member's target token resolves to, and who is targeting you
+- what the sanctioned cast-target APIs answer for a watched cast (`PlayerIsSpellTarget` / `UnitShouldDisplaySpellTargetName` / `UnitSpellTargetName`), reported as *absent*, *refused*, *no answer*, *secret*, *yes* or *no* rather than as a boolean, because an alert has to behave differently in each of those
+- `UnitPosition` samples taken at the start, middle and end of a watched channeled cast: how far the group drifted before the swap resolved, whether exactly one member ended up where the caster began, and whether the caster's own target read **agrees** with the member who actually changed places. A disagreement is printed in full and nobody is picked between
+- on arming, a capability report for the build you are on: which target APIs exist, which secret predicates answer, whether `restrictRelativeTargetUnits` is even a setting, which add-on restrictions are active, whether chat messaging is locked down, and the per-spell secrecy answers for Neural Silencer (`156779`) and the swap (`161399`)
 
 The aura line is the important one: "on Donut" in a Life Grip or Rescue alert only works if another player's aura is readable on your client. "none visible" means those alerts fall back to `(target unknown)`.
 
@@ -58,6 +62,18 @@ The target lines decide whether the watch list's "Targeting you" section can wor
 - [ ] `/tattle` opens configuration panel
 - [ ] Configuration panel displays correctly
 - [ ] All settings can be toggled on/off
+
+### What 0.2.0-beta.2 is asking your client to confirm
+
+These are the things the harness cannot settle, because they are questions about what a
+12.1.5 / 12.1.7 client will tell an addon. `/tattle probe` output from a raid or a key is the
+most useful single thing you can send back.
+
+- [ ] **A completed Swapblaster is no longer described as "cut short".** The client returns cast and channel start/end times in milliseconds; beta.1 subtracted them as if they were seconds, so *every* finished swap took the "cut short" wording. If you saw that, it should be gone - and if it is still there, `/tattle probe` now prints the raw pair plus both readings, which settles it in one line
+- [ ] **A swap's victim.** With both people in the group, fire a swap at one while your target frame shows the other (a `@mouseover` macro is the honest way to arrange this). The completion should name the member the spell actually moved; if it says `- aiming at <whoever your frame showed>`, the target APIs stayed secret on your client and that is the correct fallback - say so, because it tells us whether `UnitSpellTargetName` answers for other players' casts at all
+- [ ] **A Neural Silencer list inside a key.** Take the group's protected member into a Mythic+ key and look at the watch list. It should say `Unknown (+N hidden by the client)`, not `nobody`. "nobody" over a refused read is the failure this item exists to catch
+- [ ] **Chat in restricted content.** With Chat Messages on for a module, in a raid or key where addon chat is locked down: nothing should be spammed at the channel, no error bag, and the **screen warning should still fire**
+- [ ] **Chat never carries a hidden name.** If an alert's target name arrived as a secret value, the alert may appear on your screen and console; it must not appear in `/say`, `/party` or `/raid`
 
 ### Module Testing
 
@@ -101,12 +117,13 @@ If `/tattle debug` prints `WARNING: spell ID ... not found`, or the probe shows 
    - [ ] Verify an in-combat Life Grip is still ignored *by that module's own rule*, and that an out-of-combat one from the same caster alerts
 
 6. **Neural Silencer (protected players)**
-   - [ ] Have a group member wear a Neural Silencer, then have someone else Leap of Faith them
+   - [ ] Have a group member wear a Neural Silencer, have someone else **target them**, then Leap of Faith them
    - [ ] Verify `... attempted a Life Grip on Donut, but it failed because Donut is using a Neural Silencer` rather than `(target unknown)`
    - [ ] Repeat with Rescue
    - [ ] Repeat against yourself and verify the wording becomes `on you, ... you are using a Neural Silencer`
-   - [ ] Put a second person behind a silencer and verify the alert says `on a protected group member` instead of naming one of them
-   - [ ] Swapblaster a protected player and verify the backfire is reported as a blocked attempt, once
+   - [ ] Now do the same with the caster targeting **nobody** (or somebody unprotected): expect `... used Life Grip (target unknown)!` with no mention of a Neural Silencer at all. Naming the raid's protected member from "the aura never appeared" is the behaviour removed in this pass
+   - [ ] Fire a Swapblaster at a *protected* player and verify `(Pancakes is using a Neural Silencer)` appears on that swap's alerts; fire one at somebody else with the same protected player standing in the group and verify the alerts say nothing about protection
+   - [ ] Swapblaster a protected player and verify the backfire is reported as a blocked attempt, once - this is the one alert that may name a lone protected member without a target read, and with two of them it should say `on a protected group member` instead of picking
    - [ ] Have the *protected* player fire a Swapblaster at someone else, out of combat, and verify `... but Pancakes is using a Neural Silencer - that's not fair!`
    - [ ] Verify an unprotected caster gets the plain completion line with no accusation
 
@@ -135,16 +152,17 @@ If `/tattle debug` prints `WARNING: spell ID ... not found`, or the probe shows 
 
 Configure different alert methods and verify each works:
 
-1. **Console Output**
-   - [ ] Enable console output only
-   - [ ] Trigger an event
-   - [ ] Verify message appears in chat window
+1. **Console Output** (this is the debugging line - it is on whenever `/tattle debug` is on)
+   - [ ] With `/tattle debug` **off** and no module's Console output ticked, trigger an event and verify **nothing** is printed to your chat window
+   - [ ] `/tattle debug` on, trigger an event and verify every module's alert prints (plus the `[Tattle Debug]` lines)
+   - [ ] Debug off, tick one module's Console output and verify that module prints and the others do not
 
 2. **Chat Message**
-   - [ ] Enable chat message alert
+   - [ ] Enable chat message alert (the chat type defaults to `/say`, so it should appear without touching the dropdown)
    - [ ] Set to /party
    - [ ] Trigger an event
    - [ ] Verify message sent to party chat
+   - [ ] Set the chat type to `None (no chat message)` and verify nothing is sent anywhere (this option used to be labelled "console only" and looked like it was doing something)
 
 3. **Audio Alert**
    - [ ] Enable audio alert
@@ -152,11 +170,12 @@ Configure different alert methods and verify each works:
    - [ ] Click "Test" button to verify sound works
    - [ ] Trigger an event
    - [ ] Verify sound plays
+   - [ ] Trigger one Swapblaster that starts and then lands (or fails): verify **one** sound, not one per line of chat. Trigger a Life Grip, which has no start: verify its landing still makes the noise
 
-4. **Screen Warning**
-   - [ ] Enable screen warning
-   - [ ] Trigger an event
-   - [ ] Verify raid-warning style message appears on screen
+4. **Screen Warning** (on by default, and the alert a new install actually sees)
+   - [ ] Trigger an event and verify a raid-warning style message appears on screen, then disappears after *Display duration*
+   - [ ] If it never appears, look at that module's own tab: the Screen Alerts tab only controls **appearance** and has no master on/off. The tick named "Screen warning" lives on the Swapblaster / Life Grip / Rescue tab
+   - [ ] Reposition it from the Screen Alerts tab and trigger another event: the drag preview always shows the frame, so use a real alert - not the preview - to decide whether screen alerts are switched on
 
 ### Configuration Testing
 

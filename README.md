@@ -25,7 +25,7 @@ A World of Warcraft addon (retail 12.x) that alerts when a group member uses a m
 - **Neural Silencer Watch** (auras `156779` / `384129`):
   - Scans the group for the aura that blocks Swapblaster and Leap of Faith
   - **Never announces that somebody is wearing one.** Joining must not produce a roll call of who is protected - a wearer surfaces only when they are involved in a cast (below), or in the list you switched on yourself
-  - Optional **on-screen watch list** (off by default, drag-positioned from the config panel): the group's Neural Silencer wearers, and which group members currently have **you** targeted
+  - Optional **on-screen watch list** (off by default, drag-positioned from the config panel): the group's Neural Silencer wearers, and which group members currently have **you** targeted. Where the client refuses the aura reads - normal inside a key or a raid encounter - the list says `Unknown (+2 hidden by the client)` instead of claiming nobody is protected
   - Every other module reads the same scan, which is what lets them explain a blocked cast (below)
 
 ### Protected Players Are Called Out
@@ -35,6 +35,16 @@ A **Neural Silencer** makes its wearer immune to exactly the toys this addon wat
 - A grab or swap that resolved but marked nobody is reported as a blocked attempt: `Pancakes attempted a Life Grip on Donut, but it failed because Donut is using a Neural Silencer`. When the group has several protected members it says `on a protected group member` rather than guessing which one
 - A Swapblaster that backfires (`182081`) is reported the same way - that spell is the only evidence a blocked swap exists, since a swap that lands marks nobody either
 - A caster who fires a Swapblaster out of combat *while wearing one themselves* gets named for it: `Pancakes used Swapblaster, but Pancakes is using a Neural Silencer - that's not fair!`
+
+### Whom an Alert Names
+
+A movement toy's victim is the person a raid wants to know about, so the name in that sentence is the part Tattle is most careful about. It asks the client's own cast-target APIs first (`PlayerIsSpellTarget`, then `UnitSpellTargetName` behind its display gate) and the caster's target frame last - because those are different facts, and the alert says the one the evidence supports:
+
+- `Donut used Swapblaster on Maple` - the client named the spell's target
+- `Donut used Swapblaster - aiming at Pancakes` - all it would say is who the caster's interface was pointed at, which a @mouseover macro can leave sitting on somebody who was never involved
+- `Donut used Swapblaster` - nothing answered, so nobody is named, and the gap is not filled in with the nearest group member
+
+A name the client keeps as a secret value is still usable: where the build offers a sanctioned comparison, Tattle asks the client whether the hidden name belongs to each member in turn. A name belonging to somebody outside your group stays unresolved. And `/tattle probe` prints what your client will and will not answer here, which is worth knowing before trusting any of these sentences.
 
 ### Planned Modules
 
@@ -47,17 +57,18 @@ A **Neural Silencer** makes its wearer immune to exactly the toys this addon wat
 Tattle provides **per-module** alert configuration. Each module can have its own alert preferences:
 
 - **Monitor scope**: `Whole group` (any group member's cast) or `Only me` (drop a cast only when it can be proven it missed you)
-- **Console Output**: Print messages to your chat window
-- **Chat Messages**: Send alerts to /say, /yell, /party, /raid or instance chat, or keep them private (configurable per module). `Raid` and `Party` are resolved against the group you are actually in, so announcements land in a **Looking for Raid** raid as well - a plain `RAID` send there goes nowhere
+- **Screen Warnings are the alert**: on by default, because the big text in the middle of your own screen interrupts without putting words in somebody else's chat window
+- **Console Output**: prints the same line in your chat window, and is treated as *debugging*. `/tattle debug` turns it on for every module whatever is ticked; with debug off it is off unless you tick a module's own box (it is off for a new install — it used to be on, which is how a beta ended up with a chat window full of `[Tattle]` lines and no on-screen warning)
+- **Chat Messages**: Send alerts to /say, /yell, /party, /raid or instance chat (configurable per module, off by default, defaulting to `/say` when you switch them on). `Raid` and `Party` are resolved against the group you are actually in, so announcements land in a **Looking for Raid** raid as well - a plain `RAID` send there goes nowhere. The dropdown's first option is now honestly called `None (no chat message)`: it used to read "console only", which was quietly untrue whenever console output was off. Chat is also the one output with gates on it: a client that has locked addon chat down (what a restricted raid or key looks like from an addon's side) is not offered sends it will refuse - your **screen warning still fires**, because what gets locked down is chat traffic and not your interface - and a message carrying a name the client would not let an addon print is kept off a channel other people are reading
 - **Silent while you fight**: while *you* are in combat the addon does nothing at all - no module runs, no alert is sent, nothing is asked of the client. Everything it watches is an out-of-combat act, and `/tattle status` prints `In combat: YES - Tattle is silent while you fight` so the quiet is explainable rather than mysterious. The one exception is `/tattle probe`, which exists to ask what a client sends and withholds during a fight
 - **Combat awareness for the caster too**: nothing is announced while the *caster* is fighting either - a mid-fight Life Grip or Rescue is somebody's emergency cooldown doing its job, and a group member who is fighting is not griefing anybody. Each module declares which of its events that rule applies to - `outOfCombat = "all"` for the instant grab spells, `outOfCombat = "start"` for the Swapblaster, whose *landing* is still announced because a swap you began while walking can pull you into the fight (as long as you are still out of combat yourself) - and the core applies the rule, so no module carries its own combat check
-- **Audio Alerts**: Play customizable sound effects when events occur (5 sounds to choose from)
+- **Audio Alerts**: Play customizable sound effects when events occur (5 sounds to choose from), once per cast rather than once per line about it
 - **Screen Warnings**: Fully customizable on-screen alerts with:
   - Adjustable font and font size
-  - Custom positioning (drag to move)
+  - Custom positioning (drag to move, via *Reposition Screen Alerts* on the Screen Alerts tab)
   - Configurable display duration
   - Optional background
-  - Screen appearance is global, but each module controls whether to show screen alerts
+  - Screen appearance is global, but whether a module shows them at all is per module - the Screen Alerts tab has no master on/off, and "I positioned it and never saw one" is that tab's most common misreading: the drag preview always shows the frame, and the per-module tick on the Swapblaster / Life Grip / Rescue tab is what makes an alert use it
 - **Spell ID editor**: override the built-in spell IDs in-game, per module
 
 **Example**: You can configure Swapblaster to use screen + audio alerts, while Life Grip only uses console output.
@@ -237,7 +248,7 @@ ConfigSpellIDs.lua      the per-module spell ID editor
 Modules/Swapblaster.lua Swapblaster detection
 Modules/CastSpells.lua  Life Grip and Rescue, from one factory
 Modules/Silencer.lua    Neural Silencer: the shared protection lookup + watch list
-Tests/wow_stub.lua      a stub WoW client and ~106 checks; loads the addon in TOC order
+Tests/wow_stub.lua      a stub WoW client and ~190 checks; loads the addon in TOC order
 Tools/                  make_icon.py, the procedural Tattle Turtle
 ```
 

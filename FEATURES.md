@@ -18,16 +18,19 @@ The detection module (`Modules/Swapblaster.lua`, spell `161399`):
    - Reports a channel that ended early, plus cancelled/interrupted casts
    - Tracks `UNIT_SPELLCAST_CHANNEL_START` / `_CHANNEL_STOP` as well as `_START` / `_SUCCEEDED`, because the cast is flagged channeled
 
-2. **Two ways to find the other half of a cast, and neither is the combat log**
+2. **Where a victim's name comes from, and which sentence each source is allowed**
    - Life Grip and Rescue put a short aura on the player they moved, so their victim is named from that signature - proof rather than inference
-   - The Swapblaster marks nobody, so its victim is whoever the caster had targeted when the cast started, read from `<caster>target`. The toy needs a target, and 12.0.0 removed the only API that used to report a destination
-   - That is a read, so the wording is `at Pancakes` while the cast runs and `on Pancakes` once it lands. A client that is not told other players' targets gets the old sentence with nobody named - never a guess. The Monitor scope is deliberately not narrowed by this read: muting a swap because a target field pointed elsewhere would trade a rare extra alert for a missed grief
+   - The Swapblaster marks nobody, and 12.0.0 removed the combat log. What is left, in priority order: `PlayerIsSpellTarget` (did that spell target me - the one target question a player always has answered about themselves), then `UnitSpellTargetName` behind its `UnitShouldDisplaySpellTargetName` gate, then the caster's own `<caster>target` as a last resort
+   - The second and third are **not the same kind of fact**, so they do not get the same sentence. A name from the spell's own target may be named as whom it landed on: `Donut used Swapblaster on Maple`. A name from the caster's interface describes their interface: `Donut used Swapblaster - aiming at Pancakes`. That is not hedging - a @mouseover macro leaves `<caster>target` on whoever the caster last clicked, and printing that member as the victim of a swap that never touched them accuses a bystander of a thing that happened to somebody else
+   - Every sentence about a cast that did not land (cut short, failed, interrupted, backfired) uses the aiming wording whatever the evidence, because a cast that arrived nowhere arrived on nobody
+   - A name the client hands over as a **secret value** is not treated as no name: where the build has a sanctioned comparison, the client is asked whether the hidden name is each member's in turn, and a match earns the full sentence. A name that resolves to nobody in your group stays unresolved rather than becoming the nearest member. And when nothing answers, the alert says nothing about a victim - which is a different claim from the other two
+   - The Monitor scope is deliberately not narrowed by any of this: muting a swap because a target field pointed elsewhere would trade a rare extra alert for a missed grief
 
 3. **Neural Silencer Detection**
    - Checks the group for the "Neural Silencer" aura (`156779` from the item, `384129` for the craftable Mk3)
-   - Notes in the alert who is wearing one, since it blocks Swapblaster and Leap of Faith
+   - Mentions one **only about the player the cast was aimed at**: `Donut is casting Swapblaster at Pancakes (Pancakes is using a Neural Silencer)`, and nothing about protection when the target is unprotected or could not be read. It used to append `(Neural Silencer worn by Donut)` to every alert as long as one member of the group was protected, which put a bystander's name on sentences about somebody else
    - Uses `C_UnitAuras.GetAuraDataBySpellName`, which 12.1.0 made readable out of combat again
-   - Reports a backfire as what it was: `Donut attempted a Swapblaster on Pancakes, but it failed because Pancakes is using a Neural Silencer`
+   - Reports a backfire as what it was - the one event that proves a protected target without showing it, so it is the one alert allowed to name the group's lone protected member with no target read: `Donut attempted a Swapblaster on Pancakes, but it failed because Pancakes is using a Neural Silencer`
    - Names a protected caster who fires one: `... but Pancakes is using a Neural Silencer - that's not fair!`
 
 ### Neural Silencer Watch (spell IDs `156779` / `384129`)
@@ -38,7 +41,7 @@ The fourth module (`Modules/Silencer.lua`) owns the aura that blocks the other t
    - Resolves the aura names from the spell IDs (editable in-game, like every module)
    - **Announces nothing.** Having the aura is not an event: joining a raid must not read out "Donut has one on, Pancakes has one on, ...". A wearer only appears in the list below, or inside a cast alert raised by the module that saw the cast - "X tried a Swapblaster on Donut and it failed because Donut is using a Neural Silencer". This module contains no `SendAlert` call at all, which is the guarantee made checkable
 2. **Optional on-screen watch list** (off by default)
-   - Lists the group's Neural Silencer wearers
+   - Lists the group's Neural Silencer wearers - or says it was not told. In restricted content the aura read is refused rather than answered, and an empty sweep and a refused one are different facts: `Neural Silencer: Unknown (+2 hidden by the client)`, or `Donut (+1 hidden by the client)` when part of the group is readable. It never prints "nobody" over a wall of refusals
    - Optionally lists which group members currently have **you** targeted, from the `<member>target` tokens
    - Drag-positioned with "Reposition List" on its tab, exactly like the screen alert
    - Costs a couple of small group sweeps per second while visible (`UNIT_AURA` / `UNIT_TARGET` plus a 0.5 s timer, throttled). Nothing runs per frame, and the text is only rewritten when it actually changes
@@ -49,13 +52,18 @@ The fourth module (`Modules/Silencer.lua`) owns the aura that blocks the other t
 
 ### Multiple Output Methods
 
+0. **What is on by default**
+   - **Screen warning: on.** It is the alert - it interrupts you without putting words in somebody else's chat window
+   - Console output, chat message and audio: off. Console output is treated as debugging (see below), chat is a deliberate shout into a channel, and five people in a raid all beeping at once is not information
+
 1. **Console Output**
-   - Prints to your chat window
-   - Colored [Tattle] prefix for visibility
-   - Toggle on/off
+   - Prints to your chat window, with a colored [Tattle] prefix
+   - Treated as **debugging**: `/tattle debug` prints the line for every module whether or not its box is ticked, and with debug off the line only appears if you ticked that module's box
+   - Off for a new install
 
 2. **Chat Messages**
-   - Send to /say, /yell, /party, /raid, or the instance channel
+   - Send to /say, /yell, /party, /raid, or the instance channel; the default when you switch it on is `/say`
+   - The dropdown's "no chat" option is called `None (no chat message)`. It used to read "Private (console only)", which was untrue whenever console output was off - the combination simply sent nothing
    - Automatically adjusts based on group type: a `Raid` request in a Looking for Raid group is sent on the instance channel, because a plain `RAID` send there is dropped without an error. A `Raid` request while only in a party is delivered on `PARTY`
    - Toggle on/off
    - Select chat type in config (`/tattle status` shows the channel a message would really use when it differs)
@@ -69,8 +77,10 @@ The fourth module (`Modules/Silencer.lua`) owns the aura that blocks the other t
      - Achievement
    - Test button to preview sounds
    - Toggle on/off
+   - **One sound per cast**: the audio alert belongs to the first alert a cast produces, so a Swapblaster's start beeps and its landing, failure or interrupt wording does not. Life Grip and Rescue have no cast time, so their landing is that first alert and is loud
 
 4. **Screen Warnings** (Fully Customizable!)
+   - On by default for every module; the appearance is global, the on/off is per module
    - **NOT** the basic raid warning frame
    - Custom frame system with full control
 
