@@ -32,7 +32,11 @@ local function MakeGripModule(spec)
     local MODULE_ID    = spec.id
     local names        = {}   -- spell names, filled at initialize
     local isOurCast            -- matcher built at initialize
-    local armedCasts = {}     -- unitToken -> GetTime(), for a START awaiting its outcome
+    -- unitToken -> { armedAt = ..., alerted = ... }, for a START awaiting its
+    -- outcome. Not just a timestamp any more: `alerted` is how the outcome of that
+    -- cast knows the noise was already made, which is what keeps one grab from
+    -- beeping twice (see Tattle.AlertForCast).
+    local armedCasts = {}
 
     -- A START that never got an outcome is not a promise about the next cast from
     -- that unit. Without an expiry, one FAILED cast that the client reported as a
@@ -45,9 +49,8 @@ local function MakeGripModule(spec)
     -- BelongsToRecord in Modules/Swapblaster.lua) and the window alone is the rule.
     local ARM_TTL = 8
 
-    local function IsArmed(unitToken)
-        local armedAt = armedCasts[unitToken]
-        return armedAt ~= nil and (GetTime() - armedAt) <= ARM_TTL
+    local function IsArmed(armed)
+        return armed ~= nil and (GetTime() - armed.armedAt) <= ARM_TTL
     end
 
     -- The cast leaves an aura on whoever was picked up and on nobody else, so the
@@ -78,8 +81,13 @@ local function MakeGripModule(spec)
             -- reason to stay quiet.
             if Tattle.ScopeDrops(MODULE_ID, unitToken, nil) then return end
 
-            armedCasts[unitToken] = GetTime()
-            Tattle.SendAlert(string_format("%s is casting %s (out of combat)!", sourceName, action), MODULE_ID)
+            -- A record first, then the alert: AlertForCast files the fact that this
+            -- cast has spoken, on the record, and the outcome of the same cast reads
+            -- it back to decide whether it may be loud too.
+            local armed = { armedAt = GetTime() }
+            armedCasts[unitToken] = armed
+            Tattle.AlertForCast(armed,
+                string_format("%s is casting %s (out of combat)!", sourceName, action), MODULE_ID)
             Tattle.DebugPrint(action, "START (out of combat):", sourceName)
 
         elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
@@ -91,6 +99,12 @@ local function MakeGripModule(spec)
                 return
             end
 
+            -- Taken before it is cleared: whichever sentence goes out next is the
+            -- outcome of the START this unit is armed for, and the START made the
+            -- noise if there was one. Neither of these spells has a cast time, so in
+            -- practice `armed` is nil here and the landing is the first thing the
+            -- player hears -- which is the case that should be loud.
+            local armed = armedCasts[unitToken]
             armedCasts[unitToken] = nil
 
             if passengers[1] then
@@ -99,33 +113,54 @@ local function MakeGripModule(spec)
                 -- phrase gets a name because the alert and the debug line both
                 -- want it, and TargetPhrase builds a table to say three words.
                 local phrase = Tattle.TargetPhrase(passengers)
-                Tattle.SendAlert(string_format("%s used %s on %s!", sourceName, action, phrase), MODULE_ID)
+                Tattle.AlertForCast(armed,
+                    string_format("%s used %s on %s!", sourceName, action, phrase), MODULE_ID)
                 Tattle.DebugPrint(action, "SUCCESS (out of combat):", sourceName, phrase)
             else
-                -- A grab that resolved and marked nobody has one ordinary
-                -- explanation: the passenger was wearing a Neural Silencer, so the
-                -- move was refused and no aura ever appeared. Only worth claiming
-                -- when somebody in the group is actually protected -- and Rescue is
-                -- not documented as blocked by the buff, which is why the shared
-                -- wording stays at "attempted". /tattle probe lists the wearers if
-                -- you want to confirm the behaviour on your build.
-                local blocked = Tattle.BlockedBySilencer(sourceName, action, nil, unitToken)
+                -- A grab that resolved and marked nobody *may* have bounced off a
+                -- Neural Silencer, and when it clearly did that is worth more than
+                -- "target unknown". What it is not allowed to be is an inference from
+                -- "somebody in this raid is protected": that was the beta report --
+                -- one wearer in the group, and every alert carrying their name. So the
+                -- claim needs a target, and with the passenger aura never having
+                -- appeared, some reading of the target is the only thing that can supply
+                -- it - and it comes from the same source the swap alerts use, best evidence
+                -- first: the client's answer about whom the spell was pointed at, and only
+                -- then the caster's interface. These are instant casts, so by the time
+                -- SUCCEEDED lands the spell is over and the stronger answer is often
+                -- already gone; that is exactly when the weaker one is worth having, and it
+                -- is also why this claim stays at "attempted" rather than "landed on".
+                -- No read at all, or a readable one that lands on somebody who is not
+                -- protected, and the sentence stays the honest one that admits the target
+                -- is unknown. Rescue is not documented as blocked by the buff
+                -- either, which is why the shared wording stays at "attempted".
+                local target = (Tattle.CastTargetOf(unitToken))
+                local blocked = Tattle.BlockedBySilencer(sourceName, action,
+                    target and { target } or nil, unitToken)
                 if blocked then
-                    Tattle.SendAlert(blocked, MODULE_ID)
+                    Tattle.AlertForCast(armed, blocked, MODULE_ID)
                     Tattle.DebugPrint(action, "blocked:", sourceName)
                     return
                 end
-                Tattle.SendAlert(string_format("%s used %s (target unknown)!", sourceName, action), MODULE_ID)
+                Tattle.AlertForCast(armed,
+                    string_format("%s used %s (target unknown)!", sourceName, action), MODULE_ID)
                 Tattle.DebugPrint(action, "SUCCESS with no passenger:", sourceName)
             end
 
         elseif event == "UNIT_SPELLCAST_FAILED" then
-            if not IsArmed(unitToken) then return end
+            local armed = armedCasts[unitToken]
+            if not IsArmed(armed) then return end
             armedCasts[unitToken] = nil
-            -- A grab can fail for plenty of reasons, so this states who is immune
-            -- rather than blaming them for the failure.
-            Tattle.SendAlert(string_format("%s's %s failed.%s",
-                sourceName, action, Tattle.SilencerNote(unitToken)), MODULE_ID)
+            -- A grab can fail for plenty of reasons, so this only says what it can
+            -- see: the failure, and the buff of whoever the caster had picked - the
+            -- spell's own target where the client will name it, their interface where
+            -- it will not. Nothing here claims the grab reached anybody, so the weaker
+            -- source costs the sentence nothing. The old wording appended the group's
+            -- whole wearer list to every failed cast, which read as an accusation and
+            -- was not one.
+            local note = Tattle.SilencerTargetClause((Tattle.CastTargetOf(unitToken)))
+            Tattle.AlertForCast(armed,
+                string_format("%s's %s failed%s.", sourceName, action, note), MODULE_ID)
             Tattle.DebugPrint(action, "FAILED:", sourceName)
 
         elseif event == "UNIT_SPELLCAST_INTERRUPTED" then
@@ -133,9 +168,11 @@ local function MakeGripModule(spec)
             -- registered event" is only true while the event list above is the whole
             -- list, and a module that later registers a channel event would find its
             -- CHANNEL_START reported as an interruption.
-            if not IsArmed(unitToken) then return end
+            local armed = armedCasts[unitToken]
+            if not IsArmed(armed) then return end
             armedCasts[unitToken] = nil
-            Tattle.SendAlert(string_format("%s's %s was interrupted.", sourceName, action), MODULE_ID)
+            Tattle.AlertForCast(armed,
+                string_format("%s's %s was interrupted.", sourceName, action), MODULE_ID)
             Tattle.DebugPrint(action, "INTERRUPTED:", sourceName)
         end
     end

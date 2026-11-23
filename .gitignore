@@ -22,6 +22,9 @@ releases/
 # Testing
 test-results/
 
+# Local agent working notes; the shipped docs are README/FEATURES/TESTING/CHANGELOG
+AGENTS.md
+
 # Scratch and tooling byproducts
 .tmp.*
 *.dump

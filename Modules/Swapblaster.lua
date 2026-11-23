@@ -97,31 +97,65 @@ end
 -- Helpers
 -- ============================================================================
 
--- The core owns the sentence; this module only ever has the list in hand already.
-local SilencerNote = Tattle.SilencerNoteList
+-- The core owns the two sentences this module is allowed to borrow: the one that
+-- names a protected *target*, and the one that calls an attempt blocked. Neither
+-- takes a group wearer list any more -- see SilencerTargetClause in Core.lua, where a
+-- beta's "every alert says somebody has one on" became a question about one unit.
 
 -- Swap is channeled, so its cast window comes from UnitChannelInfo; a plain cast
--- window comes from UnitCastingInfo. Both return
--- (name, text, texture, startTime, endTime, ...). nil is fine -- an instant
--- spell or a restricted API call -- and just means "cannot tell".
+-- window comes from UnitCastingInfo. Both return (name, displayName, texture,
+-- startTimeMs, endTimeMs, ...), and the suffix on those two names is the whole
+-- comment: the client's own cast bar divides them before comparing against GetTime
+-- (Interface/AddOns/Blizzard_UIPanels_Game/Shared/CastingBarFrame.lua, identical in
+-- 12.1.5 and 12.1.7):
+--
+--     self.maxValue = (endTime - startTime) / 1000;
+--     self.value    = (endTime / 1000) - GetTime();
+--
+-- So this function's name is a promise about its return, and the divide is what
+-- keeps it. Returning the raw difference instead - which this did - hands
+-- FinishedAsExpected 1500 to compare against two elapsed seconds, so every swap that
+-- finished is reported as one that was cut short: the addon tells the group the
+-- griefer failed when the griefer succeeded. The test stub used to hand back a
+-- seconds-based pair, which is why nothing noticed.
+--
+-- nil is still fine - an instant spell or a restricted API call - and means "cannot
+-- tell", which the caller says out loud rather than guessing at.
 local function CastWindowSeconds(unitToken, channelled)
     local getter = channelled and UnitChannelInfo or UnitCastingInfo
     if not getter then return nil end
     local ok, _, _, _, startTime, endTime = pcall(getter, unitToken)
-    if ok and type(startTime) == "number" and type(endTime) == "number" then
-        return endTime - startTime
+    if ok and type(startTime) == "number" and type(endTime) == "number"
+       and not Tattle.IsSecretValue(startTime) and not Tattle.IsSecretValue(endTime) then
+        return (endTime - startTime) / 1000
     end
     return nil
 end
 
 -- A channeled cast that stopped early was cut short, not completed. Without a
--- known window we cannot tell, and the caller says so plainly instead of
--- guessing.
+-- known window we cannot tell, and the caller says so plainly instead of guessing.
+-- Both sides of this comparison are in seconds: GetTime() is, and
+-- CastWindowSeconds converts the client's milliseconds. A 0.35 s slack absorbs the
+-- stop event landing a moment before the nominal end of the channel - which is what
+-- the channel was always going to do - without being so wide that a cast interrupted
+-- at half its length counts as finished.
 -- " on Pancakes" / " at you" / "". The empty string is the honest answer on a
 -- client that was not told other players' targets: the sentence then reads exactly
--- as it did before the victim was knowable at all. Two forms because a cast start
--- describes where the toy was pointed and a completion says the swap happened;
--- both name the same group member, read once when the cast was armed.
+-- as it did before the victim was knowable at all.
+--
+-- Which phrase a cast may use is decided by how its victim was learned, recorded on the
+-- record as `victimSource` when the cast was armed. The two sources do not mean the same
+-- thing about the same person:
+--
+--   * "spell-target" came from the client's own cast-target API - this spell was pointed
+--     at that member. It is the only evidence that supports "used Swapblaster on".
+--   * "unit-target" came from the caster's interface, `<caster>target`. It says their
+--     button was pointed there. A @mouseover macro, which is how somebody grieves with
+--     this toy without disturbing their own interface, leaves that reading sitting on
+--     whoever they last clicked - so it can name a member who was never involved.
+--
+-- Aiming is the most either source supports, so every sentence about a cast that did not
+-- land says that. Only a landing may say "on", and only on the first kind of evidence.
 local function VictimPhrase(cast, preposition)
     local who = cast and Tattle.UnitDisplayName(cast.victim)
     if not who then return "" end
@@ -129,7 +163,33 @@ local function VictimPhrase(cast, preposition)
 end
 
 local function AimPhrase(cast)     return VictimPhrase(cast, "at") end
-local function OnPhrase(cast)      return VictimPhrase(cast, "on") end
+
+-- " on Pancakes" for a completed swap, or nothing. Nothing means the landing was not
+-- witnessed, and the caller then says where the caster was aiming. Two functions rather
+-- than one that quietly degrades into the other, because a nameless completion is still
+-- worth announcing and a witnessed-but-unnamed one is a different sentence again.
+local function OnPhrase(cast)
+    if not cast or cast.victimSource ~= "spell-target" then return "" end
+    return VictimPhrase(cast, "on")
+end
+
+-- " - aiming at Pancakes", for a completed swap whose landing nobody witnessed. The swap
+-- undeniably happened and whom the caster had selected is worth telling the group, but the
+-- sentence must not put that member in the grammatical place where a victim belongs. What
+-- it claims is about the caster's interface, which is what this evidence is about.
+local function AimingClause(cast)
+    if not cast or cast.victimSource == "spell-target" then return "" end
+    local who = Tattle.UnitDisplayName(cast.victim)
+    if not who then return "" end
+    return " - aiming at " .. who
+end
+
+-- The phrase for a swap that completed, on the strongest evidence this client gave.
+local function LandingPhrase(cast)
+    local on = OnPhrase(cast)
+    if #on > 0 then return on end
+    return AimingClause(cast)
+end
 
 local function FinishedAsExpected(cast)
     if not cast.duration then return nil end
@@ -201,16 +261,19 @@ local function ArmCast(unitToken, channelled)
         return nil
     end
 
+    -- Read now, and for a specific reason: the toy swaps the caster with whoever they
+    -- pointed it at, so at this instant the target *is* the other half of the swap. Read
+    -- once here rather than at every message, because a caster who retargets two seconds
+    -- later is not griefing somebody else. It is also the only thing that decides whether
+    -- this cast may mention a Neural Silencer at all - and where the answer came from
+    -- travels with it, because the two sources license different sentences (AimPhrase).
+    local victim, victimSource = Tattle.CastTargetOf(unitToken)
     activeCasts[unitToken] = {
-        -- Recorded now, on purpose: every alert this cast produces describes the
-        -- group as it was when the swap was fired, and one sweep per cast is
-        -- cheaper than one per message.
-        wearers   = Tattle.SilencerWearerNames(),
-        -- Also now, and for a different reason: the toy swaps you with whoever you
-        -- have targeted, so at this instant the caster's target *is* the other
-        -- half of the swap. Read once here rather than at every message, because a
-        -- caster who retargets two seconds later is not griefing somebody else.
-        victim    = Tattle.GroupMemberTargetOf(unitToken),
+        victim       = victim,
+        victimSource = victimSource,
+        -- Whether this cast has made its first alert yet -- the one that is allowed
+        -- to make a noise (Tattle.AlertForCast reads and sets it).
+        alerted   = false,
         startedAt = GetTime(),
         duration  = CastWindowSeconds(unitToken, channelled),
         family    = FamilyOf(channelled),
@@ -239,11 +302,17 @@ local function ClaimCast(unitToken, family)
     -- A cast with no record gets one now, and the target is read here too: it is
     -- weaker evidence than the read taken when the cast started (the caster may
     -- have moved on), but "we never heard the start" is not a reason to name
-    -- nobody. The wearer list stays empty -- a sweep at this point would describe
-    -- a group that had already reacted to the swap.
+    -- nobody.
+    -- The read is taken here too, for the same reason and with the same label: a victim
+    -- picked up after the fact does not get described more confidently than one caught in
+    -- the act. By this point the spell is over, so the client's own cast-target answer may
+    -- already be gone and the caster's interface is all that is left - which the source on
+    -- the record will say, in the sentence.
+    local victim, victimSource = Tattle.CastTargetOf(unitToken)
     activeCasts[unitToken] = {
-        wearers   = {},
-        victim    = Tattle.GroupMemberTargetOf(unitToken),
+        victim       = victim,
+        victimSource = victimSource,
+        alerted   = false,
         startedAt = GetTime(),
         duration  = nil,
         family    = family,
@@ -258,67 +327,85 @@ end
 -- ============================================================================
 
 -- A completed swap. When the caster is the protected one, that is the story worth
--- telling: they fired a movement toy at someone who cannot answer in kind, and the
--- generic "worn by" note is dropped because the clause already names the wearer.
+-- telling: they fired a movement toy at someone who cannot answer in kind, and that
+-- clause is the only mention of protection this sentence gets.
 --
--- The cheat check is asked first because it is one aura lookup on one unit, where
--- the fallback is a sweep of every member. Computing the wearer list up front and
--- passing it in would pay for the sweep on the branch that throws it away.
+-- A swap that *completed* is a swap a Neural Silencer did not stop, so the target's
+-- buff is not the story of this alert -- the start alert named it, if it was up when
+-- the toy was fired. This line used to end with the group's wearer list, which is the
+-- sentence the beta reported as "every alert says so-and-so has one".
 --
 -- Never reached for a cast that *began* in combat: the core's "start" policy
 -- dropped that start, so the only completion that gets here belongs to a swap
 -- that started out of combat.
 local function CompletionMessage(sourceName, unitToken, cast)
-    local on = OnPhrase(cast)
+    local on = LandingPhrase(cast)
     if not Tattle.UnitInCombat(unitToken) then
         local clause = Tattle.SilencerCheatClause(unitToken, sourceName)
         if clause then
-            -- The clause already names the protected wearer, so the generic "worn
-            -- by" note stays off this sentence.
+            -- The clause already names the protected wearer, so nothing else about
+            -- protection goes on this sentence.
             return string_format("%s used Swapblaster%s%s", sourceName, on, clause)
         end
     end
-    return string_format("%s used Swapblaster%s%s",
-        sourceName, on, SilencerNote(Tattle.SilencerWearerNames()))
+    return string_format("%s used Swapblaster%s", sourceName, on)
 end
 
 -- "Swapblaster Explosion" is what the caster eats when the player they tried to
 -- swap with was protected. It is the one event that says "a Swapblaster was fired
 -- and did nothing", and because the swap itself marks nobody it is the only
--- chance to call a blocked attempt what it was. The victim still cannot be named,
--- but a backfire can only be caused by a protected player, so the group's
--- Neural Silencer wearers are the candidate list.
+-- chance to call a blocked attempt what it was. The victim is named when the
+-- caster's target can be read; when it cannot, a backfire can only be caused by a
+-- protected player, so the group's protected members are the candidate list -- and
+-- with more than one of those the alert refuses to pick.
 local function HandleBackfire(unitToken, sourceName)
     -- Whichever half of the cast we hear about last must not announce it twice --
     -- unless the record is a stale one, in which case this backfire belongs to a
     -- later cast and deserves its own alert.
-    local cast = activeCasts[unitToken]
-    if cast and not IsStale(cast) then
-        if cast.resolved then return end
-        Resolve(cast)
+    --
+    -- `thisCast` is that decision made once: a stale record is not a record for this
+    -- attempt, so whether the older swap made a noise says nothing about this one.
+    local record = activeCasts[unitToken]
+    local thisCast = (record and not IsStale(record)) and record or nil
+    if thisCast then
+        if thisCast.resolved then return end
+        Resolve(thisCast)
     end
 
     -- The read is fresh rather than the one stored on the cast record: the backfire
-    -- is its own spell and can be the first thing we hear about. Passing it as the
-    -- victim list is safe rather than presumptuous -- BlockedBySilencer only names a
-    -- victim it can confirm is protected, and falls back to the group's wearer list
-    -- when the read is empty or lands on somebody without the buff.
-    local victim = Tattle.GroupMemberTargetOf(unitToken)
+    -- is its own spell and can be the first thing we hear about.
+    local victim = (Tattle.CastTargetOf(unitToken))
+    -- That last argument says *this event* proves the target was protected. Nothing
+    -- else a Swapblaster sends does, which is why this is the one alert allowed to
+    -- name the group's lone protected member with no target read pointing at them -
+    -- and why it still refuses to pick one when there is more than one.
     local message = Tattle.BlockedBySilencer(sourceName, "Swapblaster",
-        victim and { victim } or nil, unitToken)
-        or string_format("%s's Swapblaster%s backfired", sourceName, OnPhrase({ victim = victim }))
-    Tattle.SendAlert(message, MODULE_ID)
+        victim and { victim } or nil, unitToken, true)
+        -- AimPhrase, because a backfire is the one outcome where nobody moved: whoever is
+        -- named here was pointed at, not swapped.
+        or string_format("%s's Swapblaster%s backfired", sourceName,
+            AimPhrase({ victim = victim }))
+    -- Loud only when this is the first thing the player hears about the attempt; a
+    -- start they already heard made the noise.
+    Tattle.AlertForCast(thisCast, message, MODULE_ID)
     Tattle.DebugPrint("Swapblaster backfire:", sourceName)
 end
 
 -- Swap applies no aura to either side, so the swap itself cannot be attributed the
 -- way Life Grip and Rescue can: the destination lived only in the combat log, and
--- 12.0.0 removed it. What is left is the caster's own target, which the toy
--- requires ("Swaps your location with another party member") and which the client
--- exposes as `<caster>target` when it exposes it at all. So the alerts name the
--- victim when your client was told who the caster had targeted, and say nothing
--- about the victim when it was not -- they never guess, and never claim the swap
--- landed on somebody the caster was not looking at.
+-- 12.0.0 removed it. What is left is the client's own cast-target API, which answers for
+-- the spell and may hand the name back as a value an addon may not read, and the caster's
+-- own target, which answers for their interface.
+--
+-- So the alerts name the victim when the client's target API named one, describe a
+-- completed swap as landing on the member the caster's UI pointed at only when that is all
+-- there was and say it in aiming words, and say nothing about the victim when neither
+-- answered. They never guess.
+--
+-- That aiming rule is the correction in this revision. Treating `<caster>target` as the
+-- spell's destination is true of a hard-targeted cast and false of the @mouseover macro a
+-- griefer uses, and the difference between those two is which group member the raid is
+-- told to watch.
 local function OnEvent(event, unitToken, castGUID, spellID, spellName)
     -- `castGUID` is received and deliberately unused. See Cast bookkeeping above for
     -- why the window a record covers, rather than the identity the client put on the
@@ -355,8 +442,10 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         local cast = ArmCast(unitToken, event == "UNIT_SPELLCAST_CHANNEL_START")
         if not cast then return end
 
-        local note = SilencerNote(cast.wearers)
-        Tattle.SendAlert(string_format("%s is casting Swapblaster%s%s",
+        -- The one place a swap alert may mention protection: the aura of the member
+        -- this cast was aimed at.
+        local note = Tattle.SilencerTargetClause(cast.victim)
+        Tattle.AlertForCast(cast, string_format("%s is casting Swapblaster%s%s",
             sourceName, AimPhrase(cast), note), MODULE_ID)
         Tattle.DebugPrint("Swapblaster START:", sourceName, note)
 
@@ -364,7 +453,7 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         local claimed = ClaimCast(unitToken, FAMILY_PLAIN)
         if not claimed then return end
 
-        Tattle.SendAlert(CompletionMessage(sourceName, unitToken, claimed), MODULE_ID)
+        Tattle.AlertForCast(claimed, CompletionMessage(sourceName, unitToken, claimed), MODULE_ID)
         Tattle.DebugPrint("Swapblaster SUCCESS:", sourceName)
 
     elseif event == "UNIT_SPELLCAST_CHANNEL_STOP" then
@@ -374,16 +463,18 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         local finished = FinishedAsExpected(cast)
 
         if finished == true then
-            Tattle.SendAlert(CompletionMessage(sourceName, unitToken, cast), MODULE_ID)
+            Tattle.AlertForCast(cast, CompletionMessage(sourceName, unitToken, cast), MODULE_ID)
         else
             -- "cut short" when the channel clearly stopped early, and a plainer
-            -- "cast ended" when there was no window to measure against. The wearers
-            -- are the ones recorded when the channel started, same as the other
-            -- alerts for this cast - no second sweep for a message in the same
-            -- breath as the cast.
-            local note = SilencerNote(cast.wearers)
-            Tattle.SendAlert(string_format("%s's Swapblaster%s %s%s",
-                sourceName, OnPhrase(cast),
+            -- "cast ended" when there was no window to measure against. The only
+            -- protection note is the one about the member this swap was aimed at --
+            -- not the group's wearer list, which is what put the same bystander's
+            -- name on every alert of the evening.
+            local note = Tattle.SilencerTargetClause(cast.victim)
+            Tattle.AlertForCast(cast, string_format("%s's Swapblaster%s %s%s",
+                -- AimPhrase, not the landing phrase: a swap that stopped early landed on
+                -- nobody, so the most a victim can be called is where it was pointed.
+                sourceName, AimPhrase(cast),
                 finished == false and "was cut short" or "cast ended", note), MODULE_ID)
         end
         Tattle.DebugPrint("Swapblaster CHANNEL_STOP:", sourceName, finished)
@@ -392,17 +483,19 @@ local function OnEvent(event, unitToken, castGUID, spellID, spellName)
         local cast = ClaimCast(unitToken)
         if not cast then return end
 
-        local note = SilencerNote(cast.wearers)
-        Tattle.SendAlert(string_format("%s's Swapblaster%s failed%s",
-            sourceName, OnPhrase(cast), note), MODULE_ID)
+        local note = Tattle.SilencerTargetClause(cast.victim)
+        Tattle.AlertForCast(cast, string_format("%s's Swapblaster%s failed%s",
+            -- Failed before it landed: aiming is all this can claim.
+            sourceName, AimPhrase(cast), note), MODULE_ID)
         Tattle.DebugPrint("Swapblaster FAILED:", sourceName, note)
 
     elseif event == "UNIT_SPELLCAST_INTERRUPTED" then
         local cast = ClaimCast(unitToken)
         if not cast then return end
 
-        Tattle.SendAlert(string_format("%s's Swapblaster%s was interrupted",
-            sourceName, OnPhrase(cast)), MODULE_ID)
+        Tattle.AlertForCast(cast, string_format("%s's Swapblaster%s was interrupted",
+            -- Interrupted before it landed, same reasoning.
+            sourceName, AimPhrase(cast)), MODULE_ID)
         Tattle.DebugPrint("Swapblaster INTERRUPTED:", sourceName)
     end
 end

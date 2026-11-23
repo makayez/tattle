@@ -139,27 +139,49 @@ local function DisplayNameFor(token)
     return Tattle.GetUnitShortName(token) or "someone"
 end
 
--- "nobody" / "you" / "Donut and Pancakes", capitalised for the start of a line.
-local function NameListPhrase(names)
-    if #names == 0 then return "nobody" end
+-- "nobody" / "unknown" / "Donut and Pancakes (+2 hidden by the client)", capitalised for
+-- the start of a line.
+--
+-- `hidden` is how many members this client refused to tell us about, and it changes the
+-- first word rather than the punctuation: this line is a standing statement about the whole
+-- group, redrawn on a timer, and "nobody" is a claim that a restricted key or raid
+-- encounter has not earned. The aura read this rests on carries
+-- `SecretWhenUnitAuraRestricted` and none of the watched spells has a secrecy exemption, so
+-- inside restricted content a refusal is the ordinary answer - and a watch list that prints
+-- "nobody" there is telling the people watching for a griefer that nobody is protected.
+local function NameListPhrase(names, hidden)
+    if #names == 0 then
+        -- Capitalised by hand because the branch returns before the capitalisation below,
+        -- and "Neural Silencer: unknown" reads like a bug in the frame rather than a
+        -- statement about the client.
+        if hidden and hidden > 0 then
+            return string_format("Unknown (+%d hidden by the client)", hidden)
+        end
+        return "nobody"
+    end
     local text = Tattle.FormatList(names)
+    if hidden and hidden > 0 then
+        text = string_format("%s (+%d hidden by the client)", text, hidden)
+    end
     return (text:gsub("^%l", string_upper))
 end
 
+-- Carriers by name, and the count of members whose aura read this client refused. The
+-- sweep comes from the core rather than from IsSilencerWearer per member because the
+-- refusal has to be counted, and a per-member boolean cannot carry it.
 local function WearerNames()
     local names = {}
-    for _, token in ipairs(Tattle.GroupUnitTokens()) do
-        if Tattle.IsSilencerWearer(token) then names[#names + 1] = DisplayNameFor(token) end
-    end
-    return names
+    local carriers, hidden = Tattle.AuraCarrierSplit(Tattle.silencerNames, "HELPFUL", nil)
+    for _, token in ipairs(carriers) do names[#names + 1] = DisplayNameFor(token) end
+    return names, #hidden
 end
 
-local function BuildText(names, watchers)
+local function BuildText(names, hidden, watchers)
     local settings = GetSettings()
     local display = settings and settings.display or DEFAULT_DISPLAY
     local lines = {}
     if display.showWearers then
-        lines[#lines + 1] = string_format("Neural Silencer: %s", NameListPhrase(names))
+        lines[#lines + 1] = string_format("Neural Silencer: %s", NameListPhrase(names, hidden))
     end
     if display.showWatchers then
         lines[#lines + 1] = string_format("Targeting you: %s", NameListPhrase(watchers))
@@ -180,9 +202,17 @@ local function AnchorFrame(frame, display)
 
     -- The text hugs the same corner as the anchor, so a right-anchored list
     -- grows leftwards instead of hanging off the edge of the screen.
+    --
+    -- The frame is passed as the anchor on purpose. This line used to read
+    -- `frame.text:SetPoint(point, point)`, which looks like "anchor my TOPRIGHT to
+    -- the TOPRIGHT point" and is nothing of the kind: a string in that slot is a
+    -- region *name*, so the client went looking for a region called TOPRIGHT,
+    -- said `Couldn't find region named 'TOPRIGHT'`, and aborted the call - on the
+    -- watch list's refresh path, every sweep, which is what made the list look
+    -- missing rather than broken. Slot two takes a region or a region's name.
     local justify = point:find("LEFT") and "LEFT" or (point:find("RIGHT") and "RIGHT" or "CENTER")
     frame.text:ClearAllPoints()
-    frame.text:SetPoint(point, point)
+    frame.text:SetPoint(point, frame, point)
     frame.text:SetJustifyH(justify)
     frame.text:SetJustifyV(point:find("^TOP") and "TOP" or (point:find("^BOT") and "BOTTOM" or "MIDDLE"))
 
@@ -297,12 +327,12 @@ function Silencer:Refresh(force)
         return
     end
 
-    local names = WearerNames()
+    local names, hidden = WearerNames()
 
     if not EnsureFrame() then return end
 
     local watchers = display.showWatchers and Tattle.WatcherNames(targetEntries) or {}
-    if SetListText(BuildText(names, watchers)) then
+    if SetListText(BuildText(names, hidden, watchers)) then
         AnchorFrame(watchFrame, display)
     end
     Silencer:ApplyVisibility()
@@ -345,6 +375,10 @@ function Silencer:EnableDragMode()
     frame.bg:Show()
     frame.bg:SetColorTexture(0.9, 0.75, 0, 0.25)
     SetListText("Neural Silencer: Donut, Pancakes\nTargeting you: nobody")
+    -- Placed before it is shown. A frame that has never been anchored has no
+    -- points at all, so the thing a player drags to position their list appeared
+    -- somewhere other than the saved spot they were about to correct.
+    AnchorFrame(frame, (GetSettings() or DEFAULT_DISPLAY).display or DEFAULT_DISPLAY)
     frame:Show()
 end
 
@@ -467,8 +501,8 @@ function Silencer.BuildOptions(container, moduleId, moduleSettings, y)
     note:SetWidth(360)
     note:SetTextColor(0.75, 0.75, 0.75)
     note:SetText("Wearing a Neural Silencer is never announced on its own - joining a raid " ..
-        "should not fill chat with a roll call. Wearers appear here, and in the alert " ..
-        "when somebody tries a Swapblaster, Life Grip or Rescue on one.")
+        "should not fill chat with a roll call. Wearers appear here, and in an alert only " ..
+        "when the Swapblaster, Life Grip or Rescue was aimed at them.")
     -- Measured: the note wraps, and a row count guessed against one player's
     -- window width puts the button underneath the text on another's.
     y = y - note:GetStringHeight() - 8

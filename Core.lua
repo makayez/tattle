@@ -23,6 +23,7 @@ local table_concat = table.concat
 local table_wipe = table.wipe
 local math_min = math.min
 local string_format = string.format
+local string_lower = string.lower
 
 local IsInRaid = IsInRaid
 local UnitExists = UnitExists
@@ -368,12 +369,21 @@ InitializeModuleSettings = function(moduleId)
         -- "group" = report any group member's cast; "self" = only casts involving you
         scope   = "group",
         alerts  = {
-            console   = true,
+            -- What an alert does on an install that has never opened the config
+            -- panel. The on-screen warning is the alert: it interrupts without putting
+            -- words in somebody else's chat window. Chat is a deliberate shout into a
+            -- channel, and audio is opt-in because five people in a raid all beeping at
+            -- once is not information. Console output is *debugging* -- SendAlert
+            -- switches it on for every module when /tattle debug is set, whatever is
+            -- ticked here -- so it is off by default, which is the half a beta player
+            -- found the hard way: a chat window full of [Tattle] lines nobody asked
+            -- for, and no on-screen warning because that one was off too.
+            console   = false,
             chat      = false,
-            chatType  = "PRIVATE",  -- PRIVATE | SAY | YELL | PARTY | RAID
+            chatType  = "SAY",      -- SAY | YELL | PARTY | RAID | INSTANCE_CHAT | PRIVATE
             audioFile = SOUNDKIT.RAID_WARNING or 8959,
             audio     = false,
-            screen    = false,
+            screen    = true,
         },
     }
 
@@ -391,13 +401,16 @@ InitializeModuleSettings = function(moduleId)
         return
     end
 
+    -- Every key comes from `defaults` rather than from a literal typed next to it.
+    -- Writing the same default twice is how a migration and a fresh install end up
+    -- disagreeing about what "never set this" means.
     local a = stored.alerts
-    if a.console   == nil then a.console   = true end
-    if a.chat      == nil then a.chat      = false end
+    if a.console   == nil then a.console   = defaults.alerts.console end
+    if a.chat      == nil then a.chat      = defaults.alerts.chat end
     if a.chatType  == nil then a.chatType  = defaults.alerts.chatType end
     if a.audioFile == nil then a.audioFile = defaults.alerts.audioFile end
-    if a.audio     == nil then a.audio     = false end
-    if a.screen    == nil then a.screen    = false end
+    if a.audio     == nil then a.audio     = defaults.alerts.audio end
+    if a.screen    == nil then a.screen    = defaults.alerts.screen end
 end
 
 -- ============================================================================
@@ -688,6 +701,197 @@ local function GroupMemberTargetOf(unitToken)
 end
 Tattle.GroupMemberTargetOf = GroupMemberTargetOf
 
+-- ============================================================================
+-- Whom a cast was pointed at
+-- ============================================================================
+--
+-- Every sentence this addon says about a victim rests on this section, so the
+-- sources are worth stating exactly.
+--
+--   1. The client's own cast-target APIs. `PlayerIsSpellTarget(unit)` answers "did
+--      this unit's spell land on me", and `UnitSpellTargetName(unit)` names the
+--      spell's target behind `UnitShouldDisplaySpellTargetName(unit)`. In the 12.1.5
+--      and 12.1.7 docs both value-returning ones carry `SecretReturns = true` - not
+--      "during combat", not "inside a dungeon", just: for the general case of
+--      somebody else's cast. A name that arrives secret is therefore the ordinary
+--      outcome here rather than the exception, and every nil that leaves this section
+--      means "this client would not say", never "no".
+--   2. The caster's own target, `<caster>target`, read by GroupMemberTargetOf above.
+--      That is a fact about the caster's interface, not about the spell: a
+--      @mouseover macro leaves the hard target on whoever they last clicked, and a
+--      target change mid-channel moves it again. It can name a group member who was
+--      never involved, which is worse than naming nobody - so the source of an answer
+--      travels with the answer, and no caller may claim more than its source
+--      supports.
+--   3. Nothing else. Not the combat log, whose entry readers are SecureOnly in
+--      12.1.5 and therefore unreadable to an addon; not addon comms, which are
+--      spoofable and which document `SecretArguments = "NotAllowed"`, so the one
+--      place the answer is guaranteed to live is the griefer's own client.
+--
+-- Names come back as names, while nearly everything downstream - auras, protection
+-- checks, display - works from unit tokens, so the resolution happens once here
+-- rather than in each caller.
+
+-- An API looked up at the moment it is called. Several of these were added, renamed
+-- or removed across 11.x and 12.x, and "this build does not have it" has to come out
+-- as itself rather than as a nil that a caller reads as an answer.
+local function ApiNamed(...)
+    for i = 1, select("#", ...) do
+        local candidate = _G[select(i, ...)]
+        if type(candidate) == "function" then return candidate end
+    end
+    return nil
+end
+
+-- A boolean the client actually answered with, or nil when it refused, said nothing,
+-- or handed back a secret value that an `if` may not test. type() calls a secret
+-- boolean "boolean", so attempting the comparison is the only way to tell them apart.
+local function ReadableBool(value)
+    if type(value) ~= "boolean" then return nil end
+    if not pcall(SelfCompare, value) then return nil end
+    return value
+end
+
+-- "Did this unit's spell target me?" 12.0.0 added this as `UnitIsSpellTarget` and
+-- the 12.1.x docs know only `PlayerIsSpellTarget`; which one a build carries is not
+-- something an addon can look up, so both spellings are tried.
+local function SpellTargetIsPlayer(unitToken)
+    if not unitToken then return nil end
+    local api = ApiNamed("PlayerIsSpellTarget", "UnitIsSpellTarget")
+    if not api then return nil end
+    local ok, answer = pcall(api, unitToken)
+    if not ok then return nil end
+    return ReadableBool(answer)
+end
+Tattle.SpellTargetIsPlayer = SpellTargetIsPlayer
+
+-- Whether this client is willing to show the target's name for this unit's cast.
+-- The docs put no secrecy flag on this one, which makes it the gate rather than the
+-- answer: a false means the name API is not going to help, and asking it first keeps
+-- a question that is already known to be refused out of the path.
+local function ShouldShowSpellTargetName(unitToken)
+    if not unitToken then return nil end
+    local api = ApiNamed("UnitShouldDisplaySpellTargetName")
+    if not api then return nil end
+    local ok, answer = pcall(api, unitToken)
+    if not ok then return nil end
+    return ReadableBool(answer)
+end
+Tattle.ShouldShowSpellTargetName = ShouldShowSpellTargetName
+
+-- The name the client puts on this unit's cast, unexamined and on purpose: it may be
+-- a secret string, and a caller that wants it has to prove it printable with
+-- PlainText or report it as withheld with IsSecretValue. Returning nil here means
+-- "there is no name to have", and the two are not interchangeable.
+local function SpellTargetName(unitToken)
+    if not unitToken then return nil end
+    local api = ApiNamed("UnitSpellTargetName")
+    if not api then return nil end
+    local ok, name = pcall(api, unitToken)
+    if not ok then return nil end
+    -- A name, or nothing. `UnitSpellTargetName` is documented to return a string, and a
+    -- secret string still reports "string" on a real client, so the refusals below are
+    -- about nonsense answers rather than about secrecy. Checking for "string" exactly
+    -- would be the mistake it looks like: the test harness can only stand in for a
+    -- secret string with an object, and demanding the documented type here would mean
+    -- the withheld-name path that GroupTokenForName exists to handle never runs in a
+    -- test - which in this project has always been how a path reaches beta unexercised.
+    local valueType = type(name)
+    if valueType == "nil" or valueType == "boolean" or valueType == "number" then return nil end
+    return name
+end
+Tattle.SpellTargetName = SpellTargetName
+
+-- The sanctioned comparison, when this build has one, asked in both argument orders
+-- because it is not documented as caring which side is which. A refusal says nothing
+-- about whether the names match, so it is reported as no rather than as a miss -
+-- which is safe here only because the caller treats "no match for anybody" as "no
+-- answer", never as "certainly not this member".
+local function ClientSaysSameName(a, b)
+    if not secretEqual then return false end
+    -- No type gate. Asking whether two values are secret, or what type they report, is
+    -- itself an inspection of a value the addon is not allowed to inspect; the only
+    -- move available is to hand them to the client and accept whatever answer or refusal
+    -- comes back. A value that is not comparable at all fails inside the pcall below and
+    -- is reported as no answer, which is the same outcome and costs nothing.
+    if a == nil or b == nil then return false end   -- nil is not a secret and never reaches the client
+    local ok, same = pcall(secretEqual, a, b)
+    local answer = ok and ReadableBool(same) or nil
+    if answer ~= nil then return answer end
+    ok, same = pcall(secretEqual, b, a)
+    answer = ok and ReadableBool(same) or nil
+    return answer == true
+end
+
+-- A name from a cast-target API resolved to one of this group's unit tokens, or nil.
+--
+-- A plain name is matched against the printable short names of the group: no realm
+-- trimming is needed here because GetUnitShortName already strips it and proves the
+-- name printable, and case is folded because the two sides arrive from different
+-- APIs. A secret name cannot be printed or compared by an addon at all, so the
+-- client is asked about one member at a time; a refusal for one member is that
+-- member's answer rather than the whole question's, so the sweep continues.
+local function GroupTokenForName(name)
+    -- Only nil is refused outright. Whether a value is a string, a secret string, or
+    -- something the harness is standing in for one is not a question this addon is
+    -- allowed to answer about a value the client hid, and the two branches below each
+    -- fail safe: the plain path needs the name to prove itself printable, and the other
+    -- hands the value to the client and accepts its answer or its refusal.
+    if name == nil then return nil end
+    local plain = PlainText(name)
+    local lowered = plain and string_lower(plain) or nil
+    for _, token in ipairs(GroupUnitTokens()) do
+        local memberName = GetUnitShortName(token)
+        if lowered then
+            if memberName and string_lower(memberName) == lowered then return token end
+        else
+            -- The name we were given is a secret value. The member's name may be one
+            -- too, and asking the client to compare two values it hid from us is
+            -- exactly the question it is allowed to refuse; that is why a refusal is
+            -- skipped rather than treated as a negative.
+            local ok, theirName = pcall(UnitName, token)
+            if ok and ClientSaysSameName(name, theirName) then return token end
+        end
+    end
+    return nil
+end
+Tattle.GroupTokenForName = GroupTokenForName
+
+-- Whom a cast was pointed at: the unit token, and how that was learned.
+--
+-- The second return is not decoration. "spell-target" is a fact about the spell, so
+-- an alert may say the spell arrived; "unit-target" is a fact about the caster's UI,
+-- so an alert may say where they were aiming and nothing more. Callers that have
+-- only the second are expected to change the sentence, not to deliver the first one
+-- with a hedge - hedged accusations are still accusations.
+--
+-- (nil, nil) means nothing answered, which is a sentence alerts can and do carry: "it
+-- landed on" and "there is no evidence" are different claims, and the difference is
+-- the whole point.
+--
+-- A plain group token is passed to these APIs where one can be had, because they
+-- document `SecretArguments = "AllowedWhenUntainted"` and an addon's execution is
+-- tainted: handing them a secret token is a refusal rather than a question.
+local function CastTargetOf(unitToken)
+    if not unitToken then return nil, nil end
+    local probeToken = GroupSlotOf(unitToken) or unitToken
+
+    -- Yourself first: one call, and the answer a player cares most about.
+    if SpellTargetIsPlayer(probeToken) then return "player", "spell-target" end
+
+    if ShouldShowSpellTargetName(probeToken) ~= false then
+        local token = GroupTokenForName(SpellTargetName(probeToken))
+        if token then return token, "spell-target" end
+        -- A name that could not be resolved to a group member stays unresolved. It is
+        -- not turned into a token by guessing, and not printed as "somebody".
+    end
+
+    local target = GroupMemberTargetOf(unitToken)
+    if target then return target, "unit-target" end
+    return nil, nil
+end
+Tattle.CastTargetOf = CastTargetOf
+
 -- Group members whose current target is you, by short name. Empty means "none
 -- that we can read", not "nobody": see GroupTargetEntries.
 local function WatcherNames(entries)
@@ -702,30 +906,101 @@ local function WatcherNames(entries)
 end
 Tattle.WatcherNames = WatcherNames
 
--- True when unitToken carries an aura whose spell name is in nameSet.
--- 12.0.0 hid other players' auras; 12.1.0 relaxed that again out of combat, so
--- this is the route left for naming a cast's destination now that the combat
--- log is gone. pcall because a restricted context can refuse the read.
-local function UnitHasAnyAura(unitToken, nameSet, auraFilter)
-    if not unitToken or not nameSet then return false end
+-- A value this addon may act on: the client answered, and what it answered with is
+-- something we are allowed to test. Presence of an aura arrives as an aura token or aura
+-- info, and a hidden one arrives as a value that reports a type and refuses everything else.
+-- Treating "there is a value here I may not read" as "they have the buff" names a person on
+-- evidence that cannot be examined, so it is reported as no answer instead.
+--
+-- Deliberately not `value == value`, which is what this file's IsSecretValue does and why
+-- that one has always had to lean on its type test rather than be trusted alone: a Lua VM
+-- answers a value compared with *itself* without consulting anything, so the identity test
+-- reports a hidden value as readable. Asked of the client where the build has the sanctioned
+-- predicate, and otherwise by attempting the one operation that must fail for anything
+-- hidden - turning it into a string, which is exactly the thing an addon is not allowed to do
+-- with a name it was not given.
+local canAccessValue = (type(canaccessvalue) == "function") and canaccessvalue or nil
+
+local function ValueIsReadable(value)
+    if value == nil then return false end
+    if canAccessValue then
+        local ok, answer = pcall(canAccessValue, value)
+        if ok and type(answer) == "boolean" then
+            -- The predicate's own answer can only be relied on if it is a plain boolean, so
+            -- the comparison that would tell them apart is attempted rather than assumed.
+            local plain = (pcall(function() return answer == true end)) and answer or nil
+            if plain ~= nil then return plain == true end
+        end
+    end
+    return (pcall(tostring, value)) ~= false
+end
+
+-- Was this member's aura list answered at all, and if it was, does it hold one of
+-- nameSet's spells? Two answers rather than one, because "no" and "we may not look" are
+-- different facts and the watch list has to be able to tell them apart. A call that raises
+-- is a refusal; a call that returns nothing is a real "no".
+local function AuraReadOutcome(unitToken, nameSet, auraFilter)
+    local answered, has = false, false
+    if not unitToken or not nameSet then return false, false end
     for spellName in pairs(nameSet) do
         local ok, aura = pcall(C_UnitAuras.GetAuraDataBySpellName, unitToken, spellName, auraFilter or "HELPFUL")
-        if ok and aura then return true end
+        if not ok then
+            -- Refused outright. Not this member's answer, so nothing is recorded either way
+            -- and the caller sees `answered == false`.
+        elseif aura == nil then
+            answered = true                       -- an ordinary "no such aura"
+        elseif ValueIsReadable(aura) then
+            answered, has = true, true            -- an ordinary "yes, this one"
+        else
+            -- A value that exists and may not be read. The client is saying there is
+            -- something here without saying what, which is a refusal wearing different
+            -- clothes: counting it as a wearer names a person on an unreadable signal, and
+            -- counting it as an answer turns "we were not told" into "they are unprotected".
+        end
     end
+    return answered, has
+end
+
+-- True when unitToken carries an aura whose spell name is in nameSet, and only when the
+-- client said so. 12.0.0 hid other players' auras; 12.1.0 relaxed that again out of combat;
+-- this is the route left for naming a cast's destination now that the combat log is gone.
+-- A refusal reads as "does not have it" here, which is the conservative half of a pair -
+-- the other half is AuraCarrierSplit, which is what any sentence that *counts* people uses.
+local function UnitHasAnyAura(unitToken, nameSet, auraFilter)
+    local answered, has = AuraReadOutcome(unitToken, nameSet, auraFilter)
+    if answered and has then return true end
     return false
 end
 Tattle.UnitHasAnyAura = UnitHasAnyAura
+
+-- Who carries nameSet, and which members this client would not tell us about.
+--
+-- The second list is the one a restricted instance fills. Callers that announce a count or
+-- a list - the Silencer watch list above all, since it is a standing statement about the
+-- whole group - have to say "we were not told" when it is non-empty. Printing "nobody" over
+-- a wall of refusals is a watch list telling lies, and it is the specific way this addon
+-- could make a protected raid look unprotected to the people trying to spot a griefer.
+local function AuraCarrierSplit(nameSet, auraFilter, excludeToken)
+    local carriers, hidden = {}, {}
+    for _, token in ipairs(GroupUnitTokens()) do
+        if not IsSameUnit(token, excludeToken) then
+            local answered, has = AuraReadOutcome(token, nameSet, auraFilter)
+            if answered then
+                if has then carriers[#carriers + 1] = token end
+            else
+                hidden[#hidden + 1] = token
+            end
+        end
+    end
+    return carriers, hidden
+end
+Tattle.AuraCarrierSplit = AuraCarrierSplit
 
 -- Which group members currently carry one of nameSet's auras, as unit tokens.
 -- excludeToken drops the caster, whose own aura would otherwise look like a
 -- target (Rescue marks both the Evoker and the passenger with the same name).
 local function AuraCarriers(nameSet, auraFilter, excludeToken)
-    local carriers = {}
-    for _, token in ipairs(GroupUnitTokens()) do
-        if not IsSameUnit(token, excludeToken) and UnitHasAnyAura(token, nameSet, auraFilter) then
-            carriers[#carriers + 1] = token
-        end
-    end
+    local carriers = AuraCarrierSplit(nameSet, auraFilter, excludeToken)
     return carriers
 end
 Tattle.AuraCarriers = AuraCarriers
@@ -815,26 +1090,6 @@ local function SilencerWearerNames(excludeToken)
 end
 Tattle.SilencerWearerNames = SilencerWearerNames
 
--- " (Neural Silencer worn by Donut)" -- "" when the list is empty. A statement of
--- fact rather than an accusation, which is what a failed cast deserves: the spell
--- could have failed for any number of reasons, but it is still worth knowing
--- somebody in here is immune to it.
---
--- This is the only place that sentence is written. Modules that already swept the
--- group (the Swapblaster records its wearers when a cast starts, so a late alert
--- describes the group as it was then) pass the list; everyone else passes a token
--- to exclude and lets the sweep happen here.
-local function SilencerNoteList(wearers)
-    if not wearers or #wearers == 0 then return "" end
-    return string_format(" (Neural Silencer worn by %s)", FormatList(wearers))
-end
-Tattle.SilencerNoteList = SilencerNoteList
-
-local function SilencerNote(excludeToken)
-    return SilencerNoteList(SilencerWearerNames(excludeToken))
-end
-Tattle.SilencerNote = SilencerNote
-
 -- "Donut is" / "you are" / "Donut and Pancakes are".
 local function SilencerSubject(names)
     if #names == 0 then return nil end
@@ -843,34 +1098,62 @@ local function SilencerSubject(names)
     return names[1] .. " is"
 end
 
+-- " (Pancakes is using a Neural Silencer)" -- "" in every other case, including
+-- "there is no target to ask about" and "this target is not protected".
+--
+-- This replaces " (Neural Silencer worn by Donut, Pancakes)", which was built by
+-- sweeping the group and was therefore appended to *every* Swapblaster, Life Grip and
+-- Rescue alert for as long as exactly one member was protected. The beta report was
+-- right: that is a statement about a bystander stapled to a sentence about somebody
+-- else. A Neural Silencer is named in an alert now only because the target of the
+-- cast being described has one, which is the only claim these events support -- and
+-- that is why the question is put to one unit token rather than to the raid.
+--
+-- "" is also the answer when the target could not be read, and every caller keeps its
+-- old wording on hearing it: "your client was not told" is not licence to name the
+-- protected member who happens to be standing nearby.
+local function SilencerTargetClause(unitToken)
+    if not IsSilencerWearer(unitToken) then return "" end
+    local names = { UnitDisplayName(unitToken) or "someone" }
+    return string_format(" (%s using a Neural Silencer)", SilencerSubject(names))
+end
+Tattle.SilencerTargetClause = SilencerTargetClause
+
 -- "Pancakes attempted a Life Grip on Donut, but it failed because Donut is
--- using a Neural Silencer", or nil when nothing about this cast points at a
+-- using a Neural Silencer", or nil when nothing about *this cast* points at a
 -- silencer (so callers keep their normal wording).
 --
--- targetTokens are the victims we positively identified from their own aura.
--- When the grab was blocked no victim aura lands at all, so there is nothing to
--- identify -- in that case the candidates are exactly the group's protected
--- members, because a protected player is the only kind of player one of these
--- spells bounces off. Naming one of them is safe when there is only one; with
--- several the alert says "a protected group member" rather than guessing.
-local function BlockedBySilencer(casterName, action, targetTokens, excludeToken)
+-- targetTokens are the victims the calling module can put forward. One of them is
+-- named only when its own aura says it is protected. The group's wearer list is no
+-- longer a fallback here, for the reason given on SilencerTargetClause: with no
+-- target read, "Donut is protected" is a fact about the raid and not a fact about
+-- the cast, and it was being said as if it were the second.
+--
+-- `proven` is the one exception, and exactly one event earns it: the Swapblaster's
+-- backfire, which nothing except a protected target causes. There the group's wearers
+-- genuinely are the candidate list, because a protected player is the only kind of
+-- player one of these spells bounces off. Naming one of them is safe when there is
+-- only one; with several the alert says "a protected group member" rather than
+-- guessing.
+local function BlockedBySilencer(casterName, action, targetTokens, excludeToken, proven)
     if not casterName or not KnowsSilencers() then return nil end
 
-    local protectedNames
-    if targetTokens then
-        protectedNames = {}
-        for _, token in ipairs(targetTokens) do
-            if IsSilencerWearer(token) then
-                protectedNames[#protectedNames + 1] =
-                    IsYou(token) and "you" or (GetUnitShortName(token) or "someone")
-            end
+    local protectedNames = {}
+    for _, token in ipairs(targetTokens or {}) do
+        if IsSilencerWearer(token) then
+            protectedNames[#protectedNames + 1] =
+                IsYou(token) and "you" or (GetUnitShortName(token) or "someone")
         end
     end
 
-    if protectedNames and #protectedNames > 0 then
+    if #protectedNames > 0 then
         return string_format("%s attempted a %s on %s, but it failed because %s using a Neural Silencer",
             casterName, action, FormatList(protectedNames), SilencerSubject(protectedNames))
     end
+
+    -- Nothing about this cast says a silencer was involved, so nothing goes in the
+    -- sentence. This is the branch the beta report was about.
+    if not proven then return nil end
 
     local candidates = SilencerWearerNames(excludeToken)
     if #candidates == 0 then return nil end
@@ -1182,7 +1465,40 @@ end
 
 local ResolveChatChannel = Tattle.ResolveChatChannel
 
-local function SendAlert(message, moduleId)
+-- Whether this client currently refuses to let an addon's chat messages out. Documented
+-- on `C_ChatInfo.InChatMessagingLockdown` as "Returns true if API security restrictions
+-- regarding chat messaging are in effect" - a plain boolean, available in every
+-- environment, which matters because the scenario it fires in is the one this addon
+-- exists for: a restricted raid or key, where a griefer's casts land and where a chat
+-- alert is most wanted.
+--
+-- An absent API or a refused call answers "not restricted", deliberately the permissive
+-- side: this gate only decides whether to attempt a send the client may refuse. The
+-- check that holds safety is the printability check below, and that one does not depend
+-- on any API existing.
+local function ChatMessagingRestricted()
+    local api = (C_ChatInfo and C_ChatInfo.InChatMessagingLockdown) or nil
+    if type(api) ~= "function" then return false end
+    local ok, answer = pcall(api)
+    if not ok then return false end
+    return ReadableBool(answer) == true
+end
+Tattle.ChatMessagingRestricted = ChatMessagingRestricted
+
+-- The alert API: route one sentence to the channels this module has switched
+-- on. A module speaking *about a cast* goes through AlertForCast below instead, which
+-- is what decides the sound question; nothing in the shipped modules calls this one
+-- directly any more.
+--
+-- `opts` is optional and currently carries one thing: `sound = false`, meaning
+-- "this sentence is about a cast the player has already been heard about".
+--
+-- The audio alert is the part of an alert that interrupts, and one cast used to make
+-- it two or three times: the start, then the landing, then the failure wording for the
+-- same Swapblaster. A player with a protected member in the raid heard it on every
+-- alert of that kind all evening. The sound belongs to a cast's first alert; the
+-- follow-ups are for reading. See AlertForCast, which is what decides that.
+local function SendAlert(message, moduleId, opts)
     if not TattleDB or not TattleDB.enabled then return end
     if not IsGrouped() then return end
 
@@ -1194,21 +1510,44 @@ local function SendAlert(message, moduleId)
 
     DebugPrint("Alert:", message)
 
-    if alerts.console then
+    -- Debug means "show me everything", so it prints for every module whether or not
+    -- that module's own Console output box is ticked. With debug off this is the
+    -- addon's debugging line, and it stays off unless somebody asks for it: the alert
+    -- a player asked for is the on-screen warning, and the chat line if they switched
+    -- that on too.
+    if TattleDB.debug or alerts.console then
         print(string_format("|cffff6600[Tattle]|r %s", message))
     end
 
-    -- chatType "PRIVATE" means console only: the console block above already
-    -- printed it, so there is nothing to send.
+    -- chatType "PRIVATE" means no chat at all: the console block above may or may not
+    -- have printed the line, depending on debug and that module's Console output, and
+    -- that is the honest answer -- the dropdown calls this option "None" for the same
+    -- reason. A module with only this switched on alerts nobody but whoever is
+    -- watching their own chat window with debug on.
     local channel = ResolveChatChannel(alerts.chatType or "PRIVATE")
     if alerts.chat and channel ~= "PRIVATE" then
-        C_Timer.After(0.1, function()
-            local ok, err = pcall(SendChatMessage, message, channel)
-            if not ok then DebugPrint("Chat send failed:", err) end
-        end)
+        if ChatMessagingRestricted() then
+            -- Do not attempt a send this client has said it will refuse. The screen
+            -- warning below is untouched: what gets locked down is chat traffic, not the
+            -- player's own interface - and the alert a restricted key most needs is the
+            -- one that never leaves the machine. Silence here is the client's decision
+            -- about the channel, not the addon deciding the alert was unimportant.
+            DebugPrint("Chat suppressed: client has chat messaging locked down")
+        elseif not PlainText(message) then
+            -- The one gate that does not ask permission. A message carrying something the
+            -- client will not let an addon print - typically a target name it handed over
+            -- as a secret value - is not a message to push at whoever else is reading that
+            -- channel. Console and screen may still carry it for the player alone.
+            DebugPrint("Chat suppressed: message holds a value the client hides")
+        else
+            C_Timer.After(0.1, function()
+                local ok, err = pcall(SendChatMessage, message, channel)
+                if not ok then DebugPrint("Chat send failed:", err) end
+            end)
+        end
     end
 
-    if alerts.audio and alerts.audioFile then
+    if alerts.audio and alerts.audioFile and not (opts and opts.sound == false) then
         local ok, err = pcall(PlaySound, alerts.audioFile)
         if not ok then DebugPrint("Sound failed:", err) end
     end
@@ -1219,6 +1558,25 @@ local function SendAlert(message, moduleId)
     end
 end
 Tattle.SendAlert = SendAlert
+
+-- Send one alert about one cast, and make a noise only if this is the first alert
+-- that cast has produced. `cast` is the calling module's own record for the cast --
+-- any table it already keeps -- and this files the fact that it spoke on it, which is
+-- why the record has to outlive the event that made it (see the cast bookkeeping in
+-- Modules/Swapblaster.lua). `nil` means the module has no record to speak for, so
+-- this alert is all the player gets and it is allowed to be loud.
+--
+-- Keying on "has this cast already been announced" rather than on the event kind is
+-- deliberate. Neither Life Grip nor Rescue has a cast time, so for those the landing
+-- *is* the first alert and should sound; a Swapblaster that only ever reached us as a
+-- completion is in the same position. The two channeled halves of one swap, or a
+-- start and its failure, are not.
+local function AlertForCast(cast, message, moduleId)
+    local first = not (cast and cast.alerted)
+    if cast then cast.alerted = true end
+    SendAlert(message, moduleId, { sound = first })
+end
+Tattle.AlertForCast = AlertForCast
 
 -- ============================================================================
 -- OnEvent

@@ -54,6 +54,69 @@ local frames = {}          -- every frame created, for the proxy audit
 -- of "constant I forgot to define" bug walk past green. See the check that reads
 -- this list at the end of the run.
 local nilGeometry = {}
+-- Geometry calls the client would have refused for a reason other than a nil: an
+-- anchor point it has no such name for, or a region name it cannot resolve. Same
+-- purpose as the list above, separate list because the failure is different - and
+-- because this one *raises*, like the client does, so the code that was on the way
+-- to showing a frame stops where the client would have stopped.
+local badGeometry = {}
+
+-- Every region the client can resolve by name. A *string* in SetPoint's second slot
+-- is one of these, which is the whole trap: see auditSetPoint.
+local namedRegions = {}
+local POINT_NAMES = {
+    TOP = true, BOTTOM = true, LEFT = true, RIGHT = true, CENTER = true,
+    TOPLEFT = true, TOPRIGHT = true, BOTTOMLEFT = true, BOTTOMRIGHT = true,
+}
+
+-- SetPoint's argument shapes are
+--   (point), (point, regionOrRegionName), (point, region, relativePoint),
+--   (point, region, relativePoint, x, y), (point, x, y)
+-- and there is no (point, relativePoint) form -- that one died with the 1.x client,
+-- which is why a string in slot two is a region *name* and never an anchor name.
+-- `text:SetPoint("TOPRIGHT", "TOPRIGHT")` loaded fine here for its whole life and
+-- threw `Couldn't find region named 'TOPRIGHT'` six times in a live raid, on the
+-- watch list's own refresh path, which is also why the list never appeared.
+local function auditSetPoint(...)
+    local count = select("#", ...)
+    local args = { ... }
+
+    local function fail(msg)
+        badGeometry[#badGeometry + 1] = "SetPoint " .. msg
+        error("SetPoint(): " .. msg, 0)
+    end
+
+    local point = args[1]
+    if point ~= nil and (type(point) ~= "string" or not POINT_NAMES[point]) then
+        fail("unknown anchor point " .. tostring(point))
+    end
+
+    local second = args[2]
+    if count >= 2 and second ~= nil then
+        if type(second) == "string" then
+            if not namedRegions[second] then
+                fail("couldn't find region named '" .. second .. "'")
+            end
+        elseif type(second) ~= "table" and type(second) ~= "number" then
+            fail("cannot anchor to " .. tostring(second))
+        end
+    end
+
+    -- Slots past the second hold a relative point, then two offsets. A string there
+    -- has to be an anchor name; anything that is neither is not a geometry argument.
+    for i = 3, count do
+        local value = args[i]
+        if value ~= nil then
+            if type(value) == "string" then
+                if not POINT_NAMES[value] then
+                    fail("unknown relative point '" .. value .. "'")
+                end
+            elseif type(value) ~= "number" then
+                fail("argument #" .. i .. " is neither a point name nor an offset")
+            end
+        end
+    end
+end
 local eventFrames = {}     -- event name -> { frame, ... }
 local timers = {}
 local tickers = {}         -- { interval = n, fn = f, Cancel = ... }, for manual sweeps
@@ -102,6 +165,9 @@ do
             table.insert(parent._children, f)
         end
         table.insert(frames, f)
+        -- A frame created with a name is addressable by that name from an anchor
+        -- call, which is the only reason the harness needs to know the set.
+        if name then namedRegions[name] = f end
 
         f.SetScript = function(_, script, fn) f._scripts[script] = fn end
         f.GetScript = function(_, script) return f._scripts[script] end
@@ -173,7 +239,7 @@ do
             if type(w) == "number" then f._width = w end
             if type(ht) == "number" then f._height = ht end
         end
-        f.SetPoint = function(_, ...) audit("SetPoint", ...) end
+        f.SetPoint = function(_, ...) audit("SetPoint", ...); auditSetPoint(...) end
         f.SetFont = function(_, path, size) audit("SetFont", path, size) end
         f.GetWidth = function() return f._width or 100 end
         f.GetHeight = function() return f._height or 24 end
@@ -204,9 +270,20 @@ C_Timer = {
     end,
 }
 
+-- A client does not let one timer callback take down the addon: it catches the
+-- error, shows the bubble and keeps ticking. So the harness catches it too, and
+-- counts it - `callbackErrors` is what a player would have read as an error bag,
+-- and the check at the end of the run is "nobody's watch list threw on a sweep".
+local callbackErrors = {}
+
 local function fireTickers()
     for _, ticker in ipairs(tickers) do
-        if not ticker.cancelled then ticker.fn() end
+        if not ticker.cancelled then
+            local ok, err = pcall(ticker.fn)
+            if not ok then
+                callbackErrors[#callbackErrors + 1] = "ticker: " .. tostring(err)
+            end
+        end
     end
 end
 
@@ -221,7 +298,12 @@ end
 local function runTimers()
     local pending = timers
     timers = {}
-    for _, fn in ipairs(pending) do fn() end
+    for _, fn in ipairs(pending) do
+        local ok, err = pcall(fn)
+        if not ok then
+            callbackErrors[#callbackErrors + 1] = "C_Timer.After: " .. tostring(err)
+        end
+    end
 end
 
 local clock = 1000
@@ -372,12 +454,18 @@ Secret = (function()
 end)()
 
 -- UnitCastingInfo/UnitChannelInfo return
--- (name, text, texture, startTime, endTime, isTrade, notInterruptible, spellID).
+-- (name, displayName, texture, startTimeMs, endTimeMs, isTrade, notInterruptible,
+-- spellID). The two timing returns carry `Ms` in their documented names, and
+-- Blizzard's own cast bar divides them by 1000 before comparing against GetTime, so
+-- the stub answers in milliseconds as well. This is the fidelity fix behind the
+-- module's window bug: a stub that returns seconds here makes a module that treats
+-- the pair as seconds look correct in every check, right up to the moment a real
+-- client reports a completed swap as one that was cut short.
 UnitCastingInfo = function()
-    return "Swap", nil, nil, clock, clock + 1.5, false, false, 161399
+    return "Swap", nil, nil, clock * 1000, (clock + 1.5) * 1000, false, false, 161399
 end
 UnitChannelInfo = function()
-    return "Swap", nil, nil, clock, clock + 1.5, false, false, 161399
+    return "Swap", nil, nil, clock * 1000, (clock + 1.5) * 1000, false, false, 161399
 end
 
 -- Which units are fighting. Set per check with setCombatUnits.
@@ -385,8 +473,43 @@ local combatUnits = {}
 UnitAffectingCombat = function(unit) return combatUnits[unit] == true end
 local function setCombatUnits(...) combatUnits = {} for _, u in ipairs({...}) do combatUnits[u] = true end end
 
-PlaySound = function() return true end
+-- Recorded, because "one cast makes one noise" is a claim about how many times
+-- PlaySound runs, and a stub that plays and forgets cannot answer it.
+local soundPlays = {}
+PlaySound = function(soundId)
+    table.insert(soundPlays, soundId)
+    return true
+end
+-- Chat lockdown, the restricted-content behaviour: while it is in effect the client
+-- refuses to let an addon's SendChatMessage reach anybody. A switch rather than a
+-- constant because the scenario it happens in - a restricted raid or key - is where a
+-- griefer's casts and Tattle's chat alerts both land, so what is under test is what the
+-- addon does when the client says no, not whether it believes the client.
+local chatMessagingLockedDown = false
+
+C_ChatInfo = {
+    InChatMessagingLockdown = function() return chatMessagingLockedDown end,
+}
+
+-- The client's own questions about hidden values. Both are documented in 12.1.x, both take a
+-- value rather than inspecting it, and `canaccessvalue` in particular is what lets an addon
+-- ask "may I use this?" without doing anything to it - which is the only legitimate test an
+-- addon has. Answered from the registry, so they can see what the addon cannot.
+issecretvalue = function(value) return Secret.isSecretValue(value) end
+canaccessvalue = function(value) return not Secret.isSecretValue(value) end
+
+-- Counted at the very top, before any refusal, because "the addon never attempted the
+-- send" and "the addon attempted it and the client said no" are two different outcomes and
+-- the difference is the whole behaviour the chat gates exist to produce. A check that only
+-- looks at what arrived cannot tell them apart, and said so itself for one full run.
+local chatSendAttempts = 0
+
 SendChatMessage = function(message, channel)
+    chatSendAttempts = chatSendAttempts + 1
+    if chatMessagingLockedDown then
+        table.insert(chatRefusals, tostring(message))
+        error("SendChatMessage is not allowed while chat messaging is locked down", 0)
+    end
     -- The client's rule, applied at the boundary: a secret value does not belong in
     -- a chat message. A message *built* out of one failed earlier, so this is the
     -- backstop for a name handed straight through.
@@ -478,6 +601,35 @@ LE_GROUP_TYPE_RAID = "raid"
 -- that is not told other players' targets.
 local targets = {}
 
+-- Where every unit is standing, in yards. This exists because the probe's position
+-- channel has to be tested against a world rather than against a wish: an exchange is
+-- two members arriving at each other's starting points, and nothing about that is
+-- expressible without coordinates.
+--
+-- Members with no position set start one fixed distance apart, not at the origin.
+-- A world in which everybody overlaps would let a distance test pass on a distance of
+-- zero, which is the one way a corroborator like this can be made to look correct
+-- while it accuses whoever happens to be standing nearest.
+local MAP_ID = 980
+local positions = {}
+
+-- Your own raid index and "player" are one unit, and the core collapses them into
+-- one token wherever it can. Anything keyed by unit has to collapse the same way or a
+-- check sets up a fact about "raid4" that the addon then asks about as "player".
+local function canonicalToken(token)
+    if type(token) ~= "string" then return token end
+    local n = tonumber(string.match(token, "^raid(%d+)$"))
+    if n and group.inRaid and n == group.selfIndex then return "player" end
+    return token
+end
+
+local function defaultPosition(token)
+    local n = tonumber(string.match(token, "^raid(%d+)$"))
+        or tonumber(string.match(token, "^party(%d+)$"))
+        or 0
+    return { x = 1000 + n * 50, y = 1000, z = 0, mapID = MAP_ID }
+end
+
 -- Counted, so a check can prove that "your client was not told" is answered by one
 -- cheap question rather than a UnitIsUnit per raid member.
 unitExistsCalls, unitIsUnitCalls = 0, 0
@@ -521,6 +673,63 @@ end
 UnitIsUnit = function(a, b)
     unitIsUnitCalls = unitIsUnitCalls + 1
     return unitIsUnit(a, b)
+end
+-- Documented in both 12.1.5 and 12.1.7 as `UnitPosition(unit) -> positionX,
+-- positionY, positionZ, mapID`, with no secrecy flag on any return, so this answers
+-- plainly. A unit this client has no position for answers nothing at all - the raid
+-- member in another instance - which is the case the probe has to report as a gap in
+-- its sample rather than as a member standing at zero, zero.
+unitPositionCalls = 0
+UnitPosition = function(unit)
+    unitPositionCalls = unitPositionCalls + 1
+    local token = Secret.underlying(unit)
+    if type(token) ~= "string" or not unitExists(token) then return nil end
+    local p = positions[token]
+    if p == false then return nil end
+    if not p then p = defaultPosition(token) end
+    return p.x, p.y, p.z, p.mapID
+end
+
+-- The cast-target APIs, modelled with the flags the generated docs give them rather
+-- than in the friendliest way available. `UnitSpellTargetName` carries
+-- `SecretReturns = true`, and the case this addon lives in is another player's cast,
+-- so the harness has to walk the same "here is a value you may not read" path a beta
+-- will. The two switches below are what let one check take that away and another put
+-- it back, because the fallback chain is the behaviour under test.
+local spellTargets = {}
+local spellTargetNamesAreSecret = true
+local spellTargetNamesDisplayable = true
+
+-- Stored as a name plus an optional token, because the interesting cases are "the
+-- target is somebody outside this group" and "the target is in the group", and both
+-- have to be nameable by a check.
+local function spellTargetFor(unit)
+    return spellTargets[canonicalToken(Secret.underlying(unit))]
+end
+
+-- Flagged SecretReturns with no content predicate attached, so it answers plainly:
+-- "did that cast land on me" is the one target question a player is always allowed.
+PlayerIsSpellTarget = function(unit)
+    local entry = spellTargetFor(unit)
+    if not entry or not entry.token then return false end
+    return isMe(entry.token) and true or false
+end
+
+-- The gate. Documented with no secrecy flag, which is why the core asks it before
+-- paying for a name it may not be allowed to have.
+UnitShouldDisplaySpellTargetName = function(unit)
+    if not spellTargetFor(unit) then return nil end
+    return spellTargetNamesDisplayable and true or false
+end
+
+UnitSpellTargetName = function(unit)
+    local entry = spellTargetFor(unit)
+    if not entry or not entry.name then return nil end
+    local caster = canonicalToken(Secret.underlying(unit))
+    if spellTargetNamesAreSecret and not isMe(caster) then
+        return Secret.asSecret(entry.name)
+    end
+    return entry.name
 end
 -- Both membership queries answer for you as well as for the numbered members, the
 -- way they do on a real client: UnitInRaid("player") is true in a raid, and
@@ -617,8 +826,32 @@ local function setAura(unit, spellName, spellID)
     auras[key] = auras[key] or {}
     auras[key][spellName] = spellID
 end
+-- Restricted content, modelled as the client *refusing* an aura read rather than answering
+-- "no aura". `GetAuraDataBySpellName` carries `SecretWhenUnitAuraRestricted`, and none of
+-- the spells Tattle watches carries a per-spell secrecy exemption, so inside a key or a
+-- raid encounter a refusal is the ordinary outcome for another player's auras. A switch
+-- rather than a constant because what the watch list says about a wall of refusals is the
+-- behaviour under test, and the wrong answer to it is "nobody".
+local aurasRefused = false
+
+-- The other shape a refusal arrives in: the call succeeds and hands over a value the addon
+-- may not look at. Some restricted reads answer this way instead of raising, and it changes
+-- what "answered" means - an unreadable something is not a "no aura", and treating it as one
+-- is how a watch list reports an unprotected group on a client that never said so.
+local aurasReturnSecrets = false
+
+local function refuseAuraReads()
+    aurasRefused = true
+end
+
+local function secreteAuraReads()
+    aurasReturnSecrets = true
+end
+
 local function clearAuras()
     for unit in pairs(auras) do auras[unit] = nil end
+    aurasRefused = false
+    aurasReturnSecrets = false
 end
 
 C_UnitAuras = {}
@@ -637,7 +870,15 @@ do
     auraLookups = 0
     C_UnitAuras.GetAuraDataBySpellName = function(unit, spellName, filter)
         auraLookups = auraLookups + 1
-        return getAuraData(unit, spellName, filter)
+        -- Your own auras stay readable; the predicate is about other people.
+        if aurasRefused and not isMe(unit) then
+            error("attempt to access a secret value while execution tainted by 'Tattle'", 0)
+        end
+        local data = getAuraData(unit, spellName, filter)
+        if aurasReturnSecrets and not isMe(unit) and data then
+            return Secret.asSecret(data.spellID)
+        end
+        return data
     end
 end
 
@@ -676,6 +917,11 @@ UIDropDownMenu_SetText = function() end
 UIDropDownMenu_Initialize = function() end
 
 local interfaceOptionsRegistered = 0
+-- Deliberately *not* stubbed: `Settings.Close`. The shipping client this addon was
+-- tested against does not have it, and a stub that supplied a no-op let
+-- `Settings.Close()` sit unguarded in the Interface Options button's OnClick until a
+-- player produced `Config.lua:833: attempt to call a nil value`. A client-owned
+-- helper that is not in this table is a helper this addon has to ask for first.
 Settings = {
     RegisterCanvasLayoutCategory = function(frame, name)
         return { frame = frame, name = name }
@@ -683,7 +929,6 @@ Settings = {
     RegisterAddOnCategory = function()
         interfaceOptionsRegistered = interfaceOptionsRegistered + 1
     end,
-    Close = function() end,
 }
 
 -- print goes to the log as well as stdout so tests can assert on it.
@@ -712,6 +957,18 @@ local function check(name, ok, detail)
         checks.failed = checks.failed + 1
         realPrint("  FAIL  " .. name .. (detail and ("  -- " .. tostring(detail)) or ""))
     end
+end
+
+-- Run a module's display/settings plumbing the way the client runs it: anything it
+-- throws is caught, kept, and the UI is left in whatever state it reached. Letting one
+-- of these abort the file hid every check behind it, which is how the watch list's
+-- broken anchor presented itself as a broken harness instead of as "the list never
+-- appears" -- the actual bug report.
+local displayErrors = {}
+local function attempt(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then displayErrors[#displayErrors + 1] = tostring(err) end
+    return ok, err
 end
 
 local function dispatch(event, ...)
@@ -806,12 +1063,59 @@ local function resetWorld()
     setCombatUnits()
     clearAuras()
     for token in pairs(targets) do targets[token] = nil end
+    for token in pairs(positions) do positions[token] = nil end
+    for token in pairs(spellTargets) do spellTargets[token] = nil end
+    spellTargetNamesAreSecret, spellTargetNamesDisplayable = true, true
+    chatMessagingLockedDown = false
+    chatSendAttempts = 0
+    table.wipe(soundPlays)
+end
+
+-- Sound on, everything else off, for the checks that count PlaySound calls. Those
+-- checks are about *which* alert of a cast makes the noise, so nothing else should
+-- be making one and nothing else should be in the message log either.
+local function soundMode(moduleId)
+    local settings = TattleDB.modules[moduleId]
+    settings.enabled = true
+    settings.scope = "group"
+    settings.alerts.console, settings.alerts.chat, settings.alerts.screen = false, false, false
+    settings.alerts.audio = true
 end
 
 -- Who a group member currently has targeted. No helper for "the client was not
 -- told": that is what `resetWorld` leaves the table at.
 local function setTarget(owner, target)
     targets[owner .. "target"] = target
+end
+
+local function positionKey(token)
+    return canonicalToken(token)
+end
+
+-- Put a unit somewhere. `z` and the map default to the world's single floor, so a
+-- check that wants a cross-floor or cross-continent member asks for one explicitly.
+local function moveUnit(token, x, y, z, mapID)
+    positions[positionKey(token)] = { x = x, y = y, z = z or 0, mapID = mapID or MAP_ID }
+end
+
+-- A member whose position this client is not told - the raid member still in another
+-- instance. Distinct from "standing at the origin": a missing sample must never be
+-- readable as a position, or a corroborator will match against it.
+local function unpositionUnit(token)
+    positions[positionKey(token)] = false
+end
+
+-- Whom the client's own cast-target APIs believe a unit's current cast is on. This is
+-- deliberately separate from setTarget: the two disagreeing is the interesting case,
+-- and it is what a @mouseover cast looks like.
+local function setSpellTarget(caster, target)
+    spellTargets[canonicalToken(caster)] = { token = target, name = nameFor(target) }
+end
+
+-- A target the group has no token for: a name the APIs will happily hand over that must
+-- not be resolved into a member by proximity or resemblance.
+local function setSpellTargetName(caster, name)
+    spellTargets[canonicalToken(caster)] = { name = name }
 end
 
 -- A group member with a Neural Silencer up, by short name. "Me" is you, and you
@@ -1216,11 +1520,78 @@ dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-victim-1", 161399)
 runTimers()
 local victimPair = (sentMessages[1] and sentMessages[1].message or "(none)")
     .. " / " .. (sentMessages[2] and sentMessages[2].message or "(none)")
-check("a swap names the group member the caster had targeted",
+-- "aiming at", not "on". This is the whole correction of this revision: all this client
+-- was told is that Donut's interface had Pancakes selected, and that reading is exactly as
+-- consistent with a @mouseover swap that never touched Pancakes as with one that did. The
+-- check below covers the case where the client says more; until it does, this sentence is
+-- the strongest thing either source supports.
+check("a swap names the caster's target as where they were aiming, not as the victim",
     messageContaining("Donut is casting Swapblaster at Pancakes") ~= nil
-    and messageContaining("Donut used Swapblaster on Pancakes") ~= nil,
+    and messageContaining("Donut used Swapblaster - aiming at Pancakes") ~= nil
+    and messageContaining("Donut used Swapblaster on") == nil,
     victimPair)
 
+-- ============================================================================
+-- The @mouseover swap, which is what that wording exists for
+-- ============================================================================
+
+-- Somebody grieving with this toy points it at one member through a macro while their own
+-- target frame still shows another. The client's cast-target API knows the difference;
+-- `<caster>target` does not, and reading only the second used to report Maple's swap as
+-- Pancakes' to the whole raid. With the name readable, the spell's own target wins and the
+-- bystander must not appear at all.
+resetWorld()
+-- Five members, and I hold raid4 so that raid5 is somebody else: the bystander/victim
+-- distinction needs two members who are neither me nor the caster.
+setGroup({ raid = true, count = 5, selfIndex = 4 })
+alertMode("swapblaster", "YELL")
+spellTargetNamesAreSecret = false
+setSpellTarget("raid1", "raid5")                 -- the spell's target: Maple
+setTarget("raid1", "raid2")                      -- their interface, still on Pancakes
+table.wipe(sentMessages)
+setClock(4050)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-mouse-1", 161399)
+setClock(4052)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-mouse-1", 161399)
+runTimers()
+local mouseoverPair = (sentMessages[1] and sentMessages[1].message or "(none)")
+    .. " / " .. (sentMessages[2] and sentMessages[2].message or "(none)")
+check("a @mouseover swap names the member the spell was actually pointed at",
+    messageContaining("Donut used Swapblaster on Maple") ~= nil,
+    mouseoverPair)
+-- Checked as its own claim rather than riding along as a condition of the one above,
+-- because naming the bystander is the specific harm this whole chain exists to prevent.
+check("and the bystander left sitting in the caster's target frame is not named",
+    messageContaining("Pancakes") == nil,
+    mouseoverPair)
+
+-- The same cast on a client that hands the name over as a secret value, which the 12.1.x
+-- docs treat as the ordinary answer for another player's cast. Resolved through the
+-- sanctioned comparison it is still the spell's own target, so it still gets the stronger
+-- sentence: secrecy on its own must not quietly downgrade a real answer to "aiming".
+resetWorld()
+setGroup({ raid = true, count = 5, selfIndex = 4 })
+alertMode("swapblaster", "YELL")
+spellTargetNamesAreSecret = true
+secretCompareSupported = true
+setSpellTarget("raid1", "raid5")
+setTarget("raid1", "raid2")
+table.wipe(sentMessages)
+setClock(4060)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-mouse-2", 161399)
+setClock(4062)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-mouse-2", 161399)
+runTimers()
+local secretNamed = (sentMessages[1] and sentMessages[1].message or "(none)")
+    .. " / " .. (sentMessages[2] and sentMessages[2].message or "(none)")
+check("a secret target name the client compared for us still gets the stronger sentence",
+    messageContaining("Donut used Swapblaster on Maple") ~= nil,
+    secretNamed)
+
+-- Its own world: the block above left a spell target registered for raid1, and a check
+-- that inherits somebody else's evidence is measuring the wrong thing.
+resetWorld()
+setGroup({ raid = true, count = 5, selfIndex = 4 })
 setTarget("raid1", "player")
 table.wipe(sentMessages)
 setClock(4100)
@@ -1228,9 +1599,28 @@ dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-victim-2", 161399)
 setClock(4102)
 dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-victim-2", 161399)
 runTimers()
-check("being the other half of a swap reads as \"at you\" and \"on you\"",
+check("being only the caster's target reads as aiming, both about you and at you",
     messageContaining("Donut is casting Swapblaster at you") ~= nil
-    and messageContaining("Donut used Swapblaster on you") ~= nil,
+    and messageContaining("Donut used Swapblaster - aiming at you") ~= nil,
+    (sentMessages[1] and sentMessages[1].message or "(none)")
+    .. " / " .. (sentMessages[2] and sentMessages[2].message or "(none)"))
+
+-- And when the client will say the spell itself was pointed at you, that deserves the
+-- stronger sentence - "am I the one being teleported" is the question a player actually
+-- has, and "did that spell target me" is the one target question with no secrecy flag on
+-- it at all.
+resetWorld()
+setGroup({ raid = true, count = 5, selfIndex = 4 })
+alertMode("swapblaster", "YELL")
+setSpellTarget("raid1", "player")
+table.wipe(sentMessages)
+setClock(4150)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-victim-self", 161399)
+setClock(4152)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-victim-self", 161399)
+runTimers()
+check("being the spell's own target reads as landing on you",
+    messageContaining("Donut used Swapblaster on you") ~= nil,
     (sentMessages[1] and sentMessages[1].message or "(none)")
     .. " / " .. (sentMessages[2] and sentMessages[2].message or "(none)"))
 
@@ -1747,6 +2137,486 @@ do
         probeLine:find("Syrup", 1, true) == nil, probeLine)
 end
 
+-- Position scenarios run with your own index at raid4, so that raid5 is somebody
+-- else: the probe collapses your raid index into "player" and names you "Me", and a
+-- check that pulled a swap on your own index would be testing the wrong sentence.
+--
+-- The two argument-order mistakes this file had, pinned down. They were not style
+-- problems: both made the probe print "none exposed" about a client that had
+-- answered, so every destination report the beta sent back was read through them.
+-- UNIT_SPELLCAST_SENT is (unit, target:cstring, castGUID, spellID) in the client's
+-- own docs - so arg 3 is the cast GUID, not the spell, and a destination searched for
+-- from arg 4 upwards cannot find the one argument that carries it.
+resetWorld()
+fiveDeepRaid(5)
+callSlash("probe")
+setClock(5914)
+local sentMark = #printLog
+local sentErrors = dispatch("UNIT_SPELLCAST_SENT", "raid1", "Pancakes", "guid-1", 161399)
+runTimers()
+callSlash("probe")
+do
+    local line = lastPrintFrom(sentMark, "UNIT_SPELLCAST_SENT") or ""
+    check("the probe reads SENT's spell ID from arg 4 rather than the cast GUID at arg 3",
+        #sentErrors == 0 and line:find("spell: Swap", 1, true) ~= nil, line)
+    check("and reads SENT's destination from arg 2, resolved to the member it belongs to",
+        line:find("dest: Pancakes [raid2]", 1, true) ~= nil
+            and line:find("none exposed", 1, true) == nil, line)
+    -- The payload dump is what a future patch gets caught on, so it has to print a
+    -- number as a number. "none" in this addon means "the client sent nothing", and a
+    -- spell ID shown as "none" is the exact false negative the two checks above exist
+    -- to prevent - one step further down the same line.
+    local payload = lastPrintFrom(sentMark, "payload:") or ""
+    check("and dumps the payload with plain numbers printed as numbers, not as \"none\"",
+        payload:find("arg2=Pancakes", 1, true) ~= nil
+            and payload:find("arg3=guid-1", 1, true) ~= nil
+            and payload:find("arg4=161399", 1, true) ~= nil, payload)
+end
+
+-- The same line where the client withholds the name. A withheld destination is still
+-- a destination, and the two need to read differently: "this client exposes nothing"
+-- and "this client answered and we were not allowed to look" are different answers for
+-- anybody deciding whether an alert may name a victim. (The stub stands in for a
+-- secret string with an unindexable table, so its wording is the "not readable" one;
+-- a real client says "secret", and the check accepts either.)
+resetWorld()
+fiveDeepRaid(5)
+callSlash("probe")
+Secret.setContext(true)
+setClock(5918)
+dispatch("UNIT_SPELLCAST_SENT", "raid1", Secret.asSecret("Pancakes"), "guid-2", 161399)
+runTimers()
+Secret.setContext(false)
+callSlash("probe")
+do
+    local line = lastPrintContaining("UNIT_SPELLCAST_SENT") or ""
+    check("a withheld SENT destination is reported as withheld rather than as absent",
+        line:find("none exposed", 1, true) == nil
+            and (line:find("secret", 1, true) ~= nil or line:find("not readable", 1, true) ~= nil)
+            and line:find("Pancakes", 1, true) == nil, line)
+end
+
+-- And the position channel the corroborator is going to rest on: two samples of a
+-- swap, and the claim it is allowed to make from them. The cast is the module's own
+-- 161399, the movers are the caster and one member, and everybody else stands still
+-- so that a match here is the exchange being found rather than a tolerance being
+-- generous. Where the probe says an exchange happened, it also has to say whether the
+-- caster's own target read agrees - the disagreement a @mouseover cast produces.
+resetWorld()
+fiveDeepRaid(4)
+alertMode("swapblaster", "YELL")
+callSlash("probe")
+setClock(5922)
+-- Donut (raid1) channels a swap on Maple (raid5), who is 30 yards away, and has
+-- Maple targeted as well: the ordinary case, where the caster's own target read and
+-- what physically happened say the same thing.
+setTarget("raid1", "raid5")
+moveUnit("raid1", 100, 100)
+moveUnit("raid5", 130, 100)
+moveUnit("raid2", 105, 100)
+local swapMark = #printLog
+local posErrors = dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-swap", 161399)
+runTimers()
+setClock(5923)
+-- Halfway through the channel, Pancakes walks fifteen yards across the room. The
+-- probe takes its third sample here, which is how an allowance for "the victim was
+-- moving" ends up justified by what this group was actually doing instead of by an
+-- assumption about who was mounted where.
+moveUnit("raid2", 120, 100)
+dispatch("UNIT_SPELLCAST_CHANNEL_UPDATE", "raid1", "guid-swap", 161399)
+runTimers()
+setClock(5924)
+-- The swap resolves: the two have traded places.
+moveUnit("raid1", 130, 100)
+moveUnit("raid5", 100, 100)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-swap", 161399)
+runTimers()
+callSlash("probe")
+do
+    local line = lastPrintFrom(swapMark, "traded places") or ""
+    check("a measured trade of places is reported as an exchange, with the partner named",
+        #posErrors == 0 and line:find("Maple [raid5]", 1, true) ~= nil, line)
+    local targetLine = lastPrintFrom(swapMark, "target read:") or ""
+    check("and says the caster's target read agrees with the exchange when it does",
+        targetLine:find("agrees with the exchange", 1, true) ~= nil, targetLine)
+    local driftLine = lastPrintFrom(swapMark, "mid-channel - group drifted") or ""
+    check("a mid-channel sample measures how far the group moved while the channel ran",
+        driftLine:find("up to 15.0 yd", 1, true) ~= nil
+            and driftLine:find("(1 of 5 readable members moving", 1, true) ~= nil, driftLine)
+    check("and the drift it measured is still there to be read at the end of the cast",
+        lastPrintFrom(swapMark, "drift observed before the swap resolved: up to 15.0 yd") ~= nil, driftLine)
+    -- The channel window printed raw rather than as a verdict. The real client returns
+    -- these returns in milliseconds and the Swapblaster module subtracts them as
+    -- seconds; the beta's own output is what proves it, so the probe prints the pair
+    -- and both readings instead of picking one and being possibly wrong about it.
+    check("and logs the channel's raw timing pair with both readings of its units",
+        lastPrintFrom(swapMark, "channel window: pair") ~= nil
+            and lastPrintFrom(swapMark, "milliseconds means") ~= nil, driftLine)
+end
+
+-- The case the whole victim-naming question turns on: a @mouseover cast leaves the
+-- caster's hard target on somebody who was never involved. The swap still happens and
+-- the coordinates still show who was moved, so an alert built on the target read
+-- would accuse the bystander. The probe's job is to print that disagreement as the
+-- loud thing it is.
+resetWorld()
+fiveDeepRaid(4)
+callSlash("probe")
+setClock(5928)
+setTarget("raid1", "raid2")   -- Pancakes is the last hard target; Maple is the real victim
+moveUnit("raid1", 100, 100)
+moveUnit("raid5", 130, 100)
+local mouseMark = #printLog
+local mouseErrors = dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-mouse", 161399)
+runTimers()
+setClock(5929)
+moveUnit("raid1", 130, 100)
+moveUnit("raid5", 100, 100)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-mouse", 161399)
+runTimers()
+callSlash("probe")
+do
+    local line = lastPrintFrom(mouseMark, "DISAGREES") or ""
+    check("a target read that names the wrong member is printed as a disagreement, not as a victim",
+        #mouseErrors == 0
+            and line:find("read Pancakes [raid2]", 1, true) ~= nil
+            and line:find("exchange says Maple [raid5]", 1, true) ~= nil, line)
+    check("and the exchange still names the member who was actually moved",
+        lastPrintFrom(mouseMark, "Maple [raid5] traded places") ~= nil, line)
+end
+
+-- Two members who both end up where the caster began is an ambiguity, and the probe
+-- has to refuse to choose rather than accuse one of them.
+resetWorld()
+fiveDeepRaid(4)
+callSlash("probe")
+setClock(5932)
+moveUnit("raid1", 100, 100)
+moveUnit("raid2", 100, 2)
+moveUnit("raid3", 100, -2)
+local ambMark = #printLog
+local ambErrors = dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-amb", 161399)
+runTimers()
+setClock(5933)
+moveUnit("raid1", 100, 0)
+moveUnit("raid2", 100, 100)
+moveUnit("raid3", 100, 100)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-amb", 161399)
+runTimers()
+callSlash("probe")
+do
+    local line = lastPrintFrom(ambMark, "no exchange reported") or ""
+    check("two members who both match the caster's start is refused as ambiguous",
+        #ambErrors == 0
+            and line:find("2 members ended up where the mover began", 1, true) ~= nil
+            and lastPrintFrom(ambMark, "traded places") == nil, line)
+end
+
+-- Nobody traded places: the caster moved and nobody arrived where they started. The
+-- honest output is "no exchange", and it must not name anybody.
+resetWorld()
+fiveDeepRaid(4)
+callSlash("probe")
+setClock(5936)
+moveUnit("raid1", 100, 100)
+local noneMark = #printLog
+local noneErrors = dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-none", 161399)
+runTimers()
+setClock(5937)
+moveUnit("raid1", 140, 100)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-none", 161399)
+runTimers()
+callSlash("probe")
+do
+    local line = lastPrintFrom(noneMark, "no exchange reported") or ""
+    check("a cast that moved nobody is reported as no exchange, naming nobody",
+        #noneErrors == 0 and line:find("nobody ended up where the mover began", 1, true) ~= nil
+            and lastPrintFrom(noneMark, "traded places") == nil, line)
+end
+
+-- A member whose position this client is not told cannot be found by an exchange at
+-- all, and that has to come out as a hole in the sample rather than as a member
+-- standing at the origin. The failure mode worth guarding here is a corroborator that
+-- matches somebody against a missing sample and then names them for it.
+resetWorld()
+fiveDeepRaid(4)
+callSlash("probe")
+setClock(5940)
+moveUnit("raid1", 100, 100)
+unpositionUnit("raid5")
+local gapMark = #printLog
+local gapErrors = dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-gap", 161399)
+runTimers()
+setClock(5941)
+moveUnit("raid1", 130, 100)
+local stopGapErrors = dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-gap", 161399)
+runTimers()
+callSlash("probe")
+do
+    local line = lastPrintFrom(gapMark, "refused or had no position") or ""
+    check("a member with no readable position is reported as a hole in the sample",
+        #gapErrors == 0 and #stopGapErrors == 0
+            and line:find("1 member(s) refused or had no position", 1, true) ~= nil, line)
+    check("and nobody is named as the partner on a sample that cannot see them",
+        lastPrintFrom(gapMark, "traded places") == nil, line)
+end
+
+-- ============================================================================
+-- Where a victim's name comes from
+-- ============================================================================
+
+-- What these checks care about is not which member gets named but whether the answer
+-- carries how it was learned. "spell-target" is a fact about the spell and entitles an
+-- alert to say the spell arrived; "unit-target" is a fact about the caster's interface
+-- and entitles it to say only where they were aiming. Naming the wrong member is the
+-- failure this whole design exists to prevent, so the weaker source has to stay
+-- identifiable at the call site rather than arrive as a bare token.
+
+resetWorld()
+fiveDeepRaid(4)
+setSpellTarget("raid1", "raid5")                 -- what the client's own target API believes
+setTarget("raid1", "raid2")                      -- whom the caster last clicked
+spellTargetNamesAreSecret = false                -- this build lets the name be read
+do
+    local token, source = Tattle.CastTargetOf("raid1")
+    check("a readable cast-target name wins over the caster's hard target",
+        token == "raid5" and source == "spell-target",
+        tostring(token) .. " / " .. tostring(source))
+end
+
+-- The last resort has to be identifiable as the last resort. Here the name API answers
+-- nothing at all, so the only thing left is the caster's own target - a fact about their
+-- interface, and one that a @mouseover cast leaves sitting on whoever they last clicked.
+-- A module that could not tell this answer from the one above would say "landed on
+-- Pancakes" about a swap that landed on Maple.
+resetWorld()
+fiveDeepRaid(4)
+setSpellTargetName("raid1", nil)                 -- there is a target; the name is not being given
+setTarget("raid1", "raid2")
+do
+    local token, source = Tattle.CastTargetOf("raid1")
+    check("no name at all falls back to the caster's target, labelled as weaker evidence",
+        token == "raid2" and source == "unit-target",
+        tostring(token) .. " / " .. tostring(source))
+end
+
+-- A secret name is not the same situation. It is a value that exists, that the client
+-- will not let an addon read, and that the client *can* compare on the addon's behalf -
+-- which is why the fallback is the last resort rather than the automatic consequence of
+-- secrecy. Getting this wrong would quietly downgrade real answers to "they were aiming
+-- at" every time the name came back secret, which in 12.1.x is most of the time.
+resetWorld()
+fiveDeepRaid(4)
+setSpellTarget("raid1", "raid5")                 -- a target there is, and a name the client will hide
+setTarget("raid1", "raid2")
+do
+    spellTargetNamesAreSecret = true             -- which is the documented default for another player's cast
+    secretCompareSupported = true
+    local token, source = Tattle.CastTargetOf("raid1")
+    check("a secret name resolves through the client's own comparison when it answers",
+        token == "raid5" and source == "spell-target",
+        tostring(token) .. " / " .. tostring(source))
+end
+
+-- And only when that comparison is refused too does the weaker source get used, still
+-- labelled. A refusal for a member is that member's answer, so the sweep has to walk the
+-- whole group before it concludes nothing was learned.
+secretCompareSupported = false
+do
+    local token, source = Tattle.CastTargetOf("raid1")
+    check("a build that will not compare names falls back rather than guessing",
+        token == "raid2" and source == "unit-target",
+        tostring(token) .. " / " .. tostring(source))
+end
+secretCompareSupported = true
+
+-- A display gate that answered false is an answer. Asking the name API anyway is what
+-- the gate exists to make unnecessary, and a build that says the name should not be
+-- shown is a build that will not hand over something safe to print.
+resetWorld()
+fiveDeepRaid(4)
+setSpellTarget("raid1", "raid5")
+setTarget("raid1", "raid2")
+spellTargetNamesDisplayable = false
+do
+    local token, source = Tattle.CastTargetOf("raid1")
+    check("a display gate answered false is honoured instead of overridden",
+        token == "raid2" and source == "unit-target",
+        tostring(token) .. " / " .. tostring(source))
+end
+spellTargetNamesDisplayable = true
+
+-- Being the target is the one thing a player is always allowed to know, and it decides
+-- the question outright: no weaker source gets to argue that Pancakes was the victim of
+-- a spell that landed on you.
+resetWorld()
+fiveDeepRaid(4)
+setSpellTarget("raid1", "player")
+setTarget("raid1", "raid2")
+do
+    local token, source = Tattle.CastTargetOf("raid1")
+    check("being the spell's target answers before anything weaker is asked",
+        token == "player" and source == "spell-target",
+        tostring(token) .. " / " .. tostring(source))
+end
+
+-- And when nothing answers, that comes back as nothing. A nil here is the client
+-- declining; an earlier draft of this chain was one `or "unknown"` away from describing
+-- a nil as a member who was not there.
+resetWorld()
+fiveDeepRaid(4)
+do
+    local token, source = Tattle.CastTargetOf("raid1")
+    check("nothing answering comes back as nothing rather than as a placeholder",
+        token == nil and source == nil,
+        tostring(token) .. " / " .. tostring(source))
+end
+
+-- A target that is not in the group is not forced into the group. The swap and the
+-- teleports all refuse non-party targets on a real client, but the addon does not get to
+-- assume that about whatever the API hands back: an unresolved name stays unresolved
+-- instead of becoming the nearest member's token.
+resetWorld()
+fiveDeepRaid(4)
+spellTargetNamesAreSecret = false
+setSpellTargetName("raid1", "Stranger")          -- a name no member of this group answers to
+do
+    local token, source = Tattle.CastTargetOf("raid1")
+    check("a target outside the group is not resolved to a member who happens to be nearby",
+        token == nil and source == nil,
+        tostring(token) .. " / " .. tostring(source))
+end
+spellTargetNamesAreSecret = true
+
+-- A swap whose start this client never delivered: the record is built by the terminal event
+-- and its victim is read there instead, on a spell that has already finished and whose
+-- target the client may therefore already have forgotten. It gets the same treatment and the
+-- same label rather than a claim inherited from a moment nobody witnessed.
+-- raid3, and a clock well clear of the swap casts the probe scenarios above put on raid1:
+-- a caster with a fresh cast already on the books is the module deciding an event belongs to
+-- a cast it already reported, which is correct behaviour and a different question. This one
+-- asks only what happens when the sole thing this client ever delivered was the end.
+resetWorld()
+setGroup({ raid = true, count = 5, selfIndex = 4 })
+alertMode("swapblaster", "YELL")
+spellTargetNamesAreSecret = false
+setSpellTarget("raid3", "raid5")
+setTarget("raid3", "raid2")
+table.wipe(sentMessages)
+setClock(6100)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid3", "guid-late-only", 161399)
+runTimers()
+-- With no start there is no window to measure, so this is not claimed as a completed swap
+-- and the sentence is the "cast ended" one. What is under test is whose name is in it: the
+-- spell's target read at the terminal event, not the bystander the caster's interface was
+-- still showing. The count is part of the claim, because a check that reads whatever happens
+-- to be in the log passes on whoever else's alert is sitting there - which is how this very
+-- check passed for one run without ever having sent anything.
+check("a cast heard only at its end names the spell's target, not the stale interface",
+    #sentMessages == 1
+        and messageContaining("Maple") ~= nil
+        and messageContaining("Pancakes") == nil,
+    tostring(#sentMessages) .. " alerts, first: "
+        .. (sentMessages[1] and sentMessages[1].message or "(none)"))
+
+-- A swap that stopped early never landed on anybody, and that is true even when the client
+-- named the spell's target out loud - which is why this sentence keeps the aiming
+-- preposition on the *strongest* evidence rather than the weakest. The mistake it prevents
+-- is the tidy one: "strong evidence, so say on", when the cast did not complete.
+resetWorld()
+setGroup({ raid = true, count = 5, selfIndex = 4 })
+alertMode("swapblaster", "YELL")
+spellTargetNamesAreSecret = false
+setSpellTarget("raid3", "raid5")
+setTarget("raid3", "raid2")
+table.wipe(sentMessages)
+setClock(6110)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid3", "guid-cut-1", 161399)
+setClock(6111)                                  -- 1.0 s into a 1.5 s window
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid3", "guid-cut-1", 161399)
+runTimers()
+check("a cut-short swap says where it was pointed even when the target is well evidenced",
+    #sentMessages == 2
+        and messageContaining("Waffles's Swapblaster at Maple was cut short") ~= nil
+        and messageContaining("on Maple") == nil,
+    tostring(#sentMessages) .. " alerts, last: "
+        .. (sentMessages[2] and sentMessages[2].message or "(none)"))
+
+-- ============================================================================
+-- What is allowed to leave the machine
+-- ============================================================================
+
+-- Chat is the one alert channel other people read, so it carries two gates the console and
+-- the screen have no use for. They are checked here, at the boundary, rather than in a
+-- module: every module composes its own sentence and any of them could be the one holding a
+-- name that must not be broadcast.
+
+local function chatOnly(moduleId, chatType)
+    resetWorld()
+    TattleDB.debug = false
+    local settings = TattleDB.modules[moduleId]
+    settings.enabled = true
+    settings.scope = "group"
+    settings.alerts.console = false
+    settings.alerts.chat = true
+    settings.alerts.chatType = chatType
+    settings.alerts.audio = false
+    settings.alerts.screen = false
+    table.wipe(sentMessages)
+end
+
+chatOnly("swapblaster", "SAY")
+Tattle.SendAlert("Donut used Swapblaster on Maple", "swapblaster")
+runTimers()
+check("a plain alert reaches the chat channel the player configured",
+    #sentMessages == 1 and sentMessages[1].channel == "SAY" and chatSendAttempts == 1,
+    "arrived " .. #sentMessages .. ", attempted " .. chatSendAttempts)
+
+-- The client's own lockdown, which is what a restricted raid or a keyed dungeon looks like
+-- from an addon's side. Without this gate the send happens anyway and the pcall swallows the
+-- client's refusal, which is indistinguishable from an alert that never fired - the exact
+-- confusion this project has already been bitten by twice, from the other side.
+chatOnly("swapblaster", "SAY")
+-- Set after chatOnly, whose resetWorld() clears it back to unlocked.
+chatMessagingLockedDown = true
+Tattle.SendAlert("Donut used Swapblaster on Maple", "swapblaster")
+runTimers()
+-- The attempt count is the point of the check. Sent messages alone would stay empty either
+-- way, because this stub's SendChatMessage refuses a locked-down send on the client's
+-- behalf, and a gate that was deleted would still look green.
+check("chat the client will not carry is not even attempted",
+    #sentMessages == 0 and chatSendAttempts == 0,
+    "arrived " .. #sentMessages .. ", attempted " .. chatSendAttempts)
+
+-- And the alert is not lost, which is the half that makes the gate above safe to have. What
+-- gets locked down is chat traffic; the player's own interface is untouched, and the
+-- restricted content where the lockdown happens is exactly where a griefer's casts land.
+chatOnly("swapblaster", "SAY")
+chatMessagingLockedDown = true
+TattleDB.modules.swapblaster.alerts.screen = true
+Tattle.SendAlert("Donut used Swapblaster on Maple", "swapblaster")
+local lockedFrame = findFrameByName("TattleScreenAlertFrame")
+check("while chat is locked down the alert still reaches the player on screen",
+    lockedFrame ~= nil and lockedFrame:IsShown()
+        and lockedFrame.text:GetText() == "Donut used Swapblaster on Maple",
+    lockedFrame and (lockedFrame.text:GetText() or "<no text>") or "<no frame>")
+chatMessagingLockedDown = false
+runTimers()
+
+-- The gate that does not ask the client's permission. A name the client handed over as a
+-- secret value may be displayed to the player alone and may not be pushed at whoever else
+-- is reading SAY, and this one holds even on a build with no lockdown in effect and no
+-- cooperation from any API.
+chatOnly("swapblaster", "SAY")
+Tattle.SendAlert(Secret.asSecret("Maple"), "swapblaster")
+runTimers()
+-- Same shape, and the reason the two are separate checks: this gate is the one that does
+-- not depend on the client cooperating, so it has to be seen to stop the attempt even when
+-- nothing is locked down and the client would have accepted the bytes.
+check("a message holding a value the client hides is never offered to chat",
+    #sentMessages == 0 and chatSendAttempts == 0,
+    "arrived " .. #sentMessages .. ", attempted " .. chatSendAttempts)
+
 -- A backfire with several protected members is usually a guessing game. With the
 -- caster's target readable, the guess is unnecessary: the buffed player they were
 -- looking at is the one whose protection set the blast off.
@@ -2145,10 +3015,17 @@ resetWorld()
 
 alertMode("lifegrip", "PARTY")
 
--- The victim's "Leap of Faith" aura never appeared, and exactly one member is
--- protected: the pull bounced off them, which is worth more than "target unknown".
+-- The victim's "Leap of Faith" aura never appeared, the caster had the protected
+-- member targeted, and exactly one member is protected: the pull bounced off them,
+-- which is worth more than "target unknown".
+--
+-- The target read is doing the work in this sentence. It was not there before: the
+-- alert used to fall back to "whoever in the raid is protected", so one wearer put
+-- their name on every grip, rescue and swap the group produced. That reading is now
+-- the failing case, and the two checks below are what replaced it.
 resetWorld()
 silenceWho("Donut")
+setTarget("raid2", "raid1")       -- Pancakes had Donut targeted
 table.wipe(sentMessages)
 dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-lg-blocked", 73325)
 runTimers()
@@ -2156,9 +3033,48 @@ check("a grip that marked nobody is called a blocked attempt, naming the protect
     messageContaining("Pancakes attempted a Life Grip on Donut, but it failed because Donut is using a Neural Silencer") ~= nil,
     sentMessages[1] and sentMessages[1].message)
 
+-- Whom the spell was pointed at, when the client is willing to say, outranks whom the
+-- caster's interface was showing - and the case that proves the difference is a griefer
+-- whose macro pointed the grip at a protected member while their target frame sat on
+-- somebody unprotected. Read from the interface alone, this alert would have said
+-- "attempted on Waffles, blocked by their Neural Silencer" about a member who has no
+-- Neural Silencer and was never involved.
+resetWorld()
+setGroup({ raid = true, count = 5, selfIndex = 4 })
+silenceWho("Donut")
+spellTargetNamesAreSecret = false
+setSpellTarget("raid2", "raid1")     -- the grip's target: Donut, protected
+setTarget("raid2", "raid3")          -- their interface: Waffles, wearing nothing
+table.wipe(sentMessages)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-lg-spelltarget", 73325)
+runTimers()
+check("a grip's blocked attempt is attributed to the spell's target, not the caster's frame",
+    messageContaining("attempted a Life Grip on Donut") ~= nil
+        and messageContaining("Waffles") == nil,
+    sentMessages[1] and sentMessages[1].message)
+
+-- The same reading working against the alert, which is the half that makes it a gate
+-- rather than a source of claims. A readable spell target that is *not* protected is
+-- evidence the bounce did not happen for that reason, and the alert falls back to
+-- admitting it does not know - rather than to the protected member still sitting in the
+-- caster's target frame.
+resetWorld()
+setGroup({ raid = true, count = 5, selfIndex = 4 })
+silenceWho("Donut")
+spellTargetNamesAreSecret = false
+setSpellTarget("raid2", "raid3")     -- the grip's target: Waffles, unprotected
+setTarget("raid2", "raid1")          -- their interface: Donut, protected
+table.wipe(sentMessages)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-lg-notblocked", 73325)
+runTimers()
+check("a spell target readable as unprotected stops the blocked-attempt claim",
+    messageContaining("target unknown") ~= nil and messageContaining("Donut") == nil,
+    sentMessages[1] and sentMessages[1].message or "(none)")
+
 -- Same thing happening to you.
 resetWorld()
 silenceWho("Me")
+setTarget("raid2", "player")
 table.wipe(sentMessages)
 dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-lg-blocked-me", 73325)
 runTimers()
@@ -2166,32 +3082,82 @@ check("and the sentence switches to you correctly",
     messageContaining("Pancakes attempted a Life Grip on you, but it failed because you are using a Neural Silencer") ~= nil,
     sentMessages[1] and sentMessages[1].message)
 
--- With more than one protected member, naming one of them would be a guess.
+-- One protected member in the raid, and the client was not told who the grab was
+-- aimed at. Saying "Donut" here is a guess about a bystander, and it is the sentence
+-- a beta player reported on every alert all evening: the alert now keeps to what it
+-- saw, which is a grab that landed on nobody it could identify.
 resetWorld()
 silenceWho("Donut")
-silenceWho("Me")
 table.wipe(sentMessages)
-dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-lg-two", 73325)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-lg-no-target-read", 73325)
 runTimers()
-check("two protected members are not collapsed into a guessed victim",
-    messageContaining("Pancakes attempted a Life Grip on a protected group member, but it failed because Donut and you are using a Neural Silencer") ~= nil,
+check("a passenger-less grip whose target cannot be read names nobody as protected",
+    messageContaining("Pancakes used Life Grip (target unknown)!") ~= nil
+        and messageContaining("Neural Silencer") == nil,
     sentMessages[1] and sentMessages[1].message)
 
--- A *failed* cast only states who is immune, because it could have failed for
--- any number of other reasons.
+-- And the same with the read pointing at somebody who is *not* protected: the group's
+-- wearer list is not a stand-in for the victim, however confident it sounds.
 resetWorld()
 silenceWho("Donut")
+setTarget("raid2", "player")      -- you, and you have no silencer on
+table.wipe(sentMessages)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-lg-target-not-protected", 73325)
+runTimers()
+check("a passenger-less grip aimed at an unprotected member blames nobody",
+    messageContaining("Pancakes used Life Grip (target unknown)!") ~= nil
+        and messageContaining("Neural Silencer") == nil,
+    sentMessages[1] and sentMessages[1].message)
+
+-- A *failed* cast could have failed for any number of reasons, so it states one
+-- fact it can see: the buff of the member the caster was looking at.
+resetWorld()
+silenceWho("Donut")
+setTarget("raid2", "raid1")
 table.wipe(sentMessages)
 dispatch("UNIT_SPELLCAST_START", "raid2", "guid-lg-fail", 73325)
 dispatch("UNIT_SPELLCAST_FAILED", "raid2", "guid-lg-fail", 73325)
 runTimers()
-check("a failed cast names the protected member as a fact, not as the cause",
-    messageContaining("Pancakes's Life Grip failed. (Neural Silencer worn by Donut)") ~= nil,
+check("a failed cast names the protected member it was aimed at, as a fact not a cause",
+    messageContaining("Pancakes's Life Grip failed (Donut is using a Neural Silencer).") ~= nil,
+    sentMessages[2] and sentMessages[2].message)
+
+-- The same fact read from the better source. The failed cast's note is the weakest claim
+-- this module makes - a buff somebody is wearing, attached to a cast that arrived nowhere -
+-- and it is still attached to the member the *spell* was pointed at rather than whoever the
+-- caster's interface happened to be showing, because "Waffles is wearing a Neural Silencer"
+-- is a sentence about Waffles either way.
+resetWorld()
+setGroup({ raid = true, count = 5, selfIndex = 4 })
+silenceWho("Donut")
+spellTargetNamesAreSecret = false
+setSpellTarget("raid2", "raid1")     -- the grip's target: Donut, protected
+setTarget("raid2", "raid3")          -- their interface: Waffles, unprotected
+table.wipe(sentMessages)
+dispatch("UNIT_SPELLCAST_START", "raid2", "guid-lg-fail-spelltarget", 73325)
+dispatch("UNIT_SPELLCAST_FAILED", "raid2", "guid-lg-fail-spelltarget", 73325)
+runTimers()
+check("a failed cast's protection note follows the spell's target, not the caster's frame",
+    messageContaining("(Donut is using a Neural Silencer)") ~= nil
+        and messageContaining("Waffles") == nil,
+    sentMessages[2] and sentMessages[2].message or "(none)")
+
+-- ...and the failure of a cast whose target it cannot see says nothing about anyone.
+resetWorld()
+silenceWho("Donut")
+table.wipe(sentMessages)
+dispatch("UNIT_SPELLCAST_START", "raid2", "guid-lg-fail-blind", 73325)
+dispatch("UNIT_SPELLCAST_FAILED", "raid2", "guid-lg-fail-blind", 73325)
+runTimers()
+check("a failed cast with no target read says nothing about a Neural Silencer",
+    messageContaining("Pancakes's Life Grip failed.") ~= nil
+        and messageContaining("Neural Silencer") == nil,
     sentMessages[2] and sentMessages[2].message)
 
 alertMode("rescue", "RAID")
 resetWorld()
 silenceWho("Donut")
+setTarget("raid2", "raid1")
 table.wipe(sentMessages)
 dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-res-blocked", 370666)
 runTimers()
@@ -2260,6 +3226,239 @@ check("an unprotected caster gets the plain completion alert",
 resetWorld()
 
 -- ============================================================================
+-- Which alerts may mention a Neural Silencer: only the ones about its wearer
+-- ============================================================================
+
+-- The beta's report was that one protected member in the raid was enough to put
+-- "so-and-so has a Neurosilencer" on every alert that followed, including the ones
+-- about a completely different player. The old note was built by sweeping the group,
+-- so it could not say anything else. These four checks are the shape of the rule that
+-- replaced it: the protected member is named when they are the target, and the alerts
+-- about everybody else stay clean.
+
+resetWorld()
+silenceWho("Donut")
+setTarget("raid2", "raid1")
+table.wipe(sentMessages)
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-swap-on-protected", 161399)
+runTimers()
+check("a swap aimed at a protected member says so on its own alert",
+    messageContaining("Pancakes is casting Swapblaster at Donut (Donut is using a Neural Silencer)") ~= nil,
+    sentMessages[1] and sentMessages[1].message)
+
+resetWorld()
+silenceWho("Donut")
+setTarget("raid2", "player")      -- the swap is coming at you; Donut is just standing there
+table.wipe(sentMessages)
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-swap-past-bystander", 161399)
+runTimers()
+check("a swap aimed at somebody else leaves the group's protected member out of it",
+    messageContaining("Pancakes is casting Swapblaster at you") ~= nil
+        and messageContaining("Neural Silencer") == nil,
+    sentMessages[1] and sentMessages[1].message)
+
+resetWorld()
+silenceWho("Donut")
+table.wipe(sentMessages)
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-swap-blind", 161399)
+runTimers()
+check("and a swap whose target cannot be read names nobody, protected or not",
+    messageContaining("Pancakes is casting Swapblaster") ~= nil
+        and messageContaining("Neural Silencer") == nil,
+    sentMessages[1] and sentMessages[1].message)
+
+resetWorld()
+silenceWho("Donut")
+setTarget("raid2", "raid1")
+table.wipe(sentMessages)
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-swap-failed-protected", 161399)
+advanceClock(1)
+dispatch("UNIT_SPELLCAST_FAILED", "raid2", "guid-swap-failed-protected", 161399)
+runTimers()
+-- "at Donut" rather than "on Donut", and the difference is not cosmetic: the cast failed,
+-- so nothing landed on anybody, and the only thing known about Donut here is where
+-- Pancakes's interface was pointed. The protected member is still the useful half of the
+-- sentence - that is what made the swap fail.
+check("a swap that failed against a protected member says whose buff it hit",
+    messageContaining("Pancakes's Swapblaster at Donut failed (Donut is using a Neural Silencer)") ~= nil,
+    sentMessages[2] and sentMessages[2].message)
+
+-- ============================================================================
+-- One cast, one noise
+-- ============================================================================
+
+-- Audio is the part of an alert that interrupts, and one Swapblaster used to make it
+-- two or three times: the start, then the landing or the failure wording for the same
+-- cast. The rule now is that the *first* alert a cast produces is the one that may be
+-- loud, which also covers the two instant spells (no START, so the landing is the
+-- first thing you hear) and a swap that only ever arrived as a completion.
+
+soundMode("swapblaster")
+
+resetWorld()
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-noise-swap", 161399)
+advanceClock(2)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid2", "guid-noise-swap", 161399)
+runTimers()
+check("a swap that starts and lands makes one sound, not two",
+    #soundPlays == 1, "sounds: " .. #soundPlays)
+
+resetWorld()
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-noise-swap-fail", 161399)
+advanceClock(1)
+dispatch("UNIT_SPELLCAST_FAILED", "raid2", "guid-noise-swap-fail", 161399)
+runTimers()
+check("and its failure wording is silent", #soundPlays == 1, "sounds: " .. #soundPlays)
+
+resetWorld()
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid2", "guid-noise-completion-only", 161399)
+runTimers()
+check("a swap heard only as a completion is the first alert it got, so it sounds",
+    #soundPlays == 1, "sounds: " .. #soundPlays)
+
+resetWorld()
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-noise-backfire", 161399)
+advanceClock(1)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-noise-backfire", 182081)
+runTimers()
+check("a backfire following a start the player already heard is silent",
+    #soundPlays == 1, "sounds: " .. #soundPlays)
+
+resetWorld()
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-noise-backfire-only", 182081)
+runTimers()
+check("a backfire that is all the player hears about an attempt makes the noise",
+    #soundPlays == 1, "sounds: " .. #soundPlays)
+
+soundMode("lifegrip")
+
+resetWorld()
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-noise-grip", 73325)
+runTimers()
+check("an instant grab's landing is its first alert, so it sounds", #soundPlays == 1,
+    "sounds: " .. #soundPlays)
+
+resetWorld()
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_START", "raid2", "guid-noise-grip-both", 73325)
+advanceClock(1)
+dispatch("UNIT_SPELLCAST_SUCCEEDED", "raid2", "guid-noise-grip-both", 73325)
+runTimers()
+check("a grab that announced its start does not also sound when it lands",
+    #soundPlays == 1, "sounds: " .. #soundPlays)
+
+resetWorld()
+advanceClock(60)
+dispatch("UNIT_SPELLCAST_START", "raid2", "guid-noise-grip-int", 73325)
+advanceClock(1)
+dispatch("UNIT_SPELLCAST_INTERRUPTED", "raid2", "guid-noise-grip-int", 73325)
+runTimers()
+check("and its interrupt wording is silent too", #soundPlays == 1, "sounds: " .. #soundPlays)
+
+alertMode("swapblaster", "YELL")
+alertMode("lifegrip", "PARTY")
+alertMode("rescue", "RAID")
+resetWorld()
+
+-- ============================================================================
+-- Alert routing: which of the four outputs an alert actually reaches
+-- ============================================================================
+
+-- Screen alerts had no coverage at all until a beta player could not say whether
+-- they had ever seen one. They had not: the wiring is fine, and the default was off.
+-- Every link is asserted here anyway, because "the frame got built, positioned and
+-- never shown" is exactly what that report was.
+
+muteAllModules()
+local swap = TattleDB.modules.swapblaster
+resetWorld()
+advanceClock(60)
+table.wipe(sentMessages)
+swap.alerts.screen = true
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-screen-on", 161399)
+local screenFrame = findFrameByName("TattleScreenAlertFrame")
+check("an alert with the screen warning on puts that message on screen",
+    screenFrame ~= nil and screenFrame:IsShown()
+        and screenFrame.text:GetText() == "Pancakes is casting Swapblaster",
+    screenFrame and (screenFrame.text:GetText() or "<no text>"))
+-- Not runTimers() before the check above: the hide timer is armed inside Show, so it
+-- is already in the pending pile and running it early would hide the frame the check
+-- is about to look at.
+runTimers()
+check("and the frame hides itself when the display duration is up",
+    screenFrame ~= nil and not screenFrame:IsShown())
+
+-- The negative half, with a baseline: the frame has to have been *up* just before for
+-- "it is not up now" to mean anything. A check that only ever inspects a frame nobody
+-- created passes for the wrong reason, which is a shape of green this file has already
+-- been burned by three times.
+resetWorld()
+advanceClock(60)
+swap.alerts.screen = true
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-screen-off-baseline", 161399)
+local shownBeforeTheSwitchOff = screenFrame ~= nil and screenFrame:IsShown()
+runTimers()
+
+resetWorld()
+advanceClock(60)
+swap.alerts.screen = false
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-screen-off", 161399)
+runTimers()
+check("a module with the screen warning off never puts anything on screen",
+    shownBeforeTheSwitchOff and screenFrame ~= nil and not screenFrame:IsShown(),
+    "baseline frame was shown: " .. tostring(shownBeforeTheSwitchOff))
+
+-- Console output is debugging. Unticked and debug off, an alert says nothing in the
+-- chat window; that is the state a fresh install is in, and the state the beta was
+-- not in (their console line was on by default and the screen warning was not).
+local function alertPrinted(mark, message)
+    return lastPrintFrom(mark, "[Tattle]|r " .. message) ~= nil
+end
+local ALERT_LINE = "Pancakes is casting Swapblaster"
+
+muteAllModules()
+TattleDB.debug = false
+swap.alerts.console = false
+resetWorld()
+advanceClock(60)
+local markNoConsole = #printLog
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-console-off", 161399)
+runTimers()
+check("an alert does not print to the chat window unless somebody asked for it",
+    not alertPrinted(markNoConsole, ALERT_LINE))
+
+TattleDB.debug = true
+resetWorld()
+advanceClock(60)
+local markDebug = #printLog
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-console-debug", 161399)
+runTimers()
+check("and /tattle debug prints it for every module, ticked or not",
+    alertPrinted(markDebug, ALERT_LINE))
+TattleDB.debug = false
+
+resetWorld()
+advanceClock(60)
+swap.alerts.console = true
+local markBox = #printLog
+dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid2", "guid-console-box", 161399)
+runTimers()
+check("the per-module Console output box still works with debug off",
+    alertPrinted(markBox, ALERT_LINE))
+swap.alerts.console = false
+resetWorld()
+
+-- ============================================================================
 -- The optional watch list
 -- ============================================================================
 
@@ -2275,14 +3474,14 @@ check("the watch list starts with no timer", activeTickers() == 0)
 -- A saved entry written by an older build must be repaired rather than trusted:
 -- the options code indexes straight into `display`.
 silSettings.display = { showList = false, showBackground = true }
-Tattle.Silencer:ApplySettings()
+attempt(Tattle.Silencer.ApplySettings, Tattle.Silencer)
 local repaired = silSettings.display
 check("a partial saved display config is filled in",
     repaired.showWearers == true and repaired.showWatchers == false
         and type(repaired.position) == "table" and repaired.position.point == "TOPRIGHT",
     "migration left holes")
 silSettings.display = nil
-Tattle.Silencer:ApplySettings()
+attempt(Tattle.Silencer.ApplySettings, Tattle.Silencer)
 check("a missing display config is rebuilt from defaults",
     silSettings.display ~= nil and silSettings.display.showList == false
         and type(silSettings.display.position) == "table",
@@ -2295,7 +3494,7 @@ silenceWho("Donut")
 targets["raid2target"] = "player"      -- Pancakes has you targeted
 silSettings.display.showList = true
 silSettings.display.showWatchers = true
-Tattle.Silencer:OptionsChanged()
+attempt(Tattle.Silencer.OptionsChanged, Tattle.Silencer)
 fireTickers()
 
 local watch = findFrameByName("TattleWatchFrame")
@@ -2312,13 +3511,57 @@ check("the list is visible while grouped", watch and watch:IsShown())
 -- Leaving the group must blank it, even though GROUP_ROSTER_UPDATE never reaches
 -- a module through the core dispatcher once you are solo.
 setGroup({})
-setClock(7000)
+setClock(8000)
 fireTickers()
 check("the list hides itself when you are not grouped", watch and not watch:IsShown())
 setGroup({ raid = true })
-setClock(7100)
+setClock(8100)
 fireTickers()
 check("and returns when you group up again", watch and watch:IsShown())
+
+-- Restricted content. The client refuses an aura read rather than answering "no aura", and
+-- the list has to say it was not told instead of reporting an unprotected group. This is
+-- the exact shape of the wrongness the 12.1.x spell data predicts: the aura reads Tattle
+-- depends on carry `SecretWhenUnitAuraRestricted`, none of the watched spells has a secrecy
+-- exemption, and this frame redraws on a timer for the whole time you are in the key - so
+-- the default failure is a confident "nobody" in front of a raid where several members are
+-- protected, shown to the very people trying to spot a griefer.
+refuseAuraReads()
+setClock(8110)
+fireTickers()
+check("a refused aura read is reported as unknown, not as nobody",
+    watch and (watch.text:GetText() or ""):find("Neural Silencer: Unknown (+2 hidden by the client)", 1, true) ~= nil,
+    watch and watch.text:GetText())
+
+-- Your own auras stay readable, because the predicate is about other people - so a partly
+-- readable group names who it may and counts the rest instead of implying the count is the
+-- whole list.
+silenceWho("Me")
+setClock(8120)
+fireTickers()
+check("a partly readable group is named, with the unreadable members counted",
+    watch and (watch.text:GetText() or ""):find("Neural Silencer: You (+2 hidden by the client)", 1, true) ~= nil,
+    watch and watch.text:GetText())
+
+-- The same problem arriving as a value instead of an error. The member who really does have
+-- the aura is not named (the client would not say, and an unreadable token is not evidence
+-- about a person), and the line still says it was not told rather than "nobody".
+resetWorld()
+silenceWho("Donut")
+silenceWho("Pancakes")
+silSettings.display.showList = true
+silSettings.display.showWatchers = true
+attempt(Tattle.Silencer.OptionsChanged, Tattle.Silencer)
+secreteAuraReads()
+setClock(8130)
+fireTickers()
+check("an aura handed back unreadable is neither counted as a wearer nor as an answer",
+    watch and (watch.text:GetText() or ""):find("Neural Silencer: Unknown (+2 hidden by the client)", 1, true) ~= nil
+        and (watch.text:GetText() or ""):find("Donut") == nil,
+    watch and watch.text:GetText())
+
+-- Back to a group the client will talk about, for the checks that follow.
+resetWorld()
 
 -- Wearing one is never news on its own. A fresh aura, a fresh group, a fresh
 -- sweep: chat stays quiet. Joining must not read out who is protected -- a
@@ -2326,16 +3569,16 @@ check("and returns when you group up again", watch and watch:IsShown())
 -- module that saw somebody try a swap, a grip or a rescue on them.
 silenceWho("Pancakes")
 table.wipe(sentMessages)
-setClock(7200)
+setClock(8200)
 dispatch("UNIT_AURA", "raid2")
 runTimers()
-setClock(7300)
+setClock(8300)
 fireTickers()
 runTimers()
-setClock(7310)
+setClock(8310)
 dispatch("GROUP_ROSTER_UPDATE", "player")   -- a fresh raid joins, half of them protected
 runTimers()
-setClock(7320)
+setClock(8320)
 fireTickers()
 runTimers()
 check("nobody is ever announced for wearing a Neural Silencer",
@@ -2345,12 +3588,12 @@ check("and the list still shows who is protected",
     watch and watch.text:GetText())
 
 -- The craftable Mk3 shares the aura name; the list must not care which it is.
-setClock(7400)
+setClock(8400)
 clearAuras()
 silenceWho("Donut")
 setAura("raid1", "Neural Silencer", 384129)
 table.wipe(sentMessages)
-setClock(7500)
+setClock(8500)
 dispatch("UNIT_AURA", "raid1")
 runTimers()
 check("the Mk3 aura ID counts too, and still says nothing",
@@ -2361,7 +3604,7 @@ check("the Mk3 aura ID counts too, and still says nothing",
 -- Switching the list off must also stop its timer.
 local tickersBefore = activeTickers()
 silSettings.display.showList = false
-Tattle.Silencer:OptionsChanged()
+attempt(Tattle.Silencer.OptionsChanged, Tattle.Silencer)
 -- With the list off there is nothing to draw, and since nothing is announced
 -- either, the module should be completely inert: no sweep, no scan.
 auraLookups = 0
@@ -2385,6 +3628,27 @@ local panel = Tattle.Config.frame
 check("panel has About + General + Screen Alerts + one tab per module",
     panel and panel.tabs and #panel.tabs == 3 + #Tattle.Config.moduleTabs,
     panel and panel.tabs and ("got " .. #panel.tabs))
+
+-- The Interface Options panel's own button: it opens Tattle's window and then asks the
+-- client to close the settings frame. That second half is the client's business -- the
+-- client this beta ran on has no `Settings.Close`, so the button threw *after* it had
+-- worked (`Config.lua:833: attempt to call a nil value`), which is the worst shape of
+-- that bug: the feature appears to work and an error bag says it did not. The stub
+-- deliberately does not supply the method, so this click exercises the guarded path.
+-- Found through the category the addon registered rather than by frame name:
+-- `CreateFrame("Frame", "TattleSettingsPanel")` is immediately followed by
+-- `settingsPanel.name = "Tattle"`, which is the label the Settings list shows and
+-- which overwrites the widget's own name. A check that looked the panel up by the
+-- name in the source would have been a check that ran zero assertions.
+local optionsPanel = Tattle.Config.category and Tattle.Config.category.frame
+local openConfigBtn = optionsPanel and findButton(optionsPanel, "Open Configuration")
+check("the Settings page hands over a button that opens the config window",
+    openConfigBtn ~= nil, "no Open Configuration button on the registered category frame")
+if openConfigBtn then
+    local okOpen, openErr = pcall(openConfigBtn:GetScript("OnClick"), openConfigBtn)
+    check("the Interface Options button opens the panel without assuming the client's UI API",
+        okOpen, openErr)
+end
 
 -- Tabs found by module rather than by position. These read "the last tab" and "tab 4",
 -- which was true only while exactly three modules existed in exactly this order - and
@@ -2415,15 +3679,24 @@ if showListCheck then
     local tickersBefore = activeTickers()
     showListCheck:SetChecked(true)
     local onShowList = showListCheck:GetScript("OnClick")
-    onShowList(showListCheck)
+    -- Guarded so a throw reads as two FAIL lines below rather than as an aborted
+    -- harness run: that is exactly what the watch list's own anchor did in a live
+    -- raid, and the interesting half of that report was that the list never appeared.
+    local okClick, clickErr = pcall(onShowList, showListCheck)
     runTimers()
+    local watchOn = findFrameByName("TattleWatchFrame")
+    check("switching the watch list on does not throw on the way to drawing it",
+        okClick, clickErr)
+    check("and the list is on screen the moment it is switched on",
+        watchOn ~= nil and watchOn:IsShown(),
+        watchOn and (watchOn.text:GetText() or "<no text>"))
     check("ticking the watch list option arms the display and its timer without a /reload",
         TattleDB.modules.silencer.display.showList == true
             and activeTickers() == tickersBefore + 1
             and findFrameByName("TattleWatchFrame") ~= nil,
         "tickers " .. tickersBefore .. " -> " .. activeTickers())
     TattleDB.modules.silencer.display.showList = false
-    Tattle.Silencer:OptionsChanged()
+    attempt(Tattle.Silencer.OptionsChanged, Tattle.Silencer)
     resetWorld()
 end
 
@@ -2433,11 +3706,11 @@ local repositionBtn = silencerTab and findButton(silencerTab, "Reposition List")
 check("the Silencers tab offers a reposition button", repositionBtn ~= nil)
 if repositionBtn then
     TattleDB.modules.silencer.display.showList = false
-    Tattle.Silencer:OptionsChanged()
+    attempt(Tattle.Silencer.OptionsChanged, Tattle.Silencer)
     table.wipe(sentMessages)
 
     local onReposition = repositionBtn:GetScript("OnClick")
-    onReposition(repositionBtn)
+    attempt(onReposition, repositionBtn)
     local preview = findFrameByName("TattleWatchFrame")
     check("Reposition List previews the list even while it is switched off",
         preview ~= nil and preview:IsShown()
@@ -2445,14 +3718,14 @@ if repositionBtn then
         preview and preview.text:GetText())
 
     local onDragStop = preview and preview:GetScript("OnDragStop")
-    if onDragStop then onDragStop(preview) end
+    if onDragStop then attempt(onDragStop, preview) end
     check("dragging it records a position",
         type(TattleDB.modules.silencer.display.position) == "table"
             and TattleDB.modules.silencer.display.position.point ~= nil,
         "position not saved")
 
     local doneBtn = findButton(silencerTab, "Done Repositioning") or repositionBtn
-    doneBtn:GetScript("OnClick")(doneBtn)
+    attempt(doneBtn:GetScript("OnClick"), doneBtn)
     check("Done Repositioning puts the list back to sleep while it is switched off",
         preview ~= nil and not preview:IsShown() and repositionBtn._text == "Reposition List",
         repositionBtn._text)
@@ -2464,7 +3737,7 @@ local moduleTab = moduleTabOf("swapblaster")
 local editBox = moduleTab and findMultiLineEditBox(moduleTab)
 local saveBtn = moduleTab and findButton(moduleTab, "Save")
 local resetBtn = moduleTab and findButton(moduleTab, "Reset to Defaults")
-local consoleCheck = moduleTab and findCheckButton(moduleTab, "Console output")
+local consoleCheck = moduleTab and findCheckButton(moduleTab, "Console output (also on with /tattle debug)")
 
 check("module tab builds editor, save, reset and alert controls",
     editBox and saveBtn and resetBtn and consoleCheck, "widget lookup failed")
@@ -2577,6 +3850,21 @@ check("a module registered late still gets settings",
     type(TattleDB.modules.latecomer) == "table"
     and type(TattleDB.modules.latecomer.alerts) == "table"
     and TattleDB.modules.latecomer.enabled == true)
+
+-- Read off `latecomer` because it is the only module in this file whose settings
+-- nobody has edited: it registers after every scenario above has been ticking boxes
+-- on the shipped modules. This is what a fresh install gets, and it is the second
+-- half of the beta report - the shipped defaults had the console line on and the
+-- on-screen warning off, which is the opposite of an alert.
+local freshAlerts = TattleDB.modules.latecomer.alerts
+check("a fresh install alerts on screen, and only on screen",
+    freshAlerts.screen == true and freshAlerts.console == false
+        and freshAlerts.chat == false and freshAlerts.audio == false,
+    string.format("console=%s chat=%s audio=%s screen=%s",
+        tostring(freshAlerts.console), tostring(freshAlerts.chat),
+        tostring(freshAlerts.audio), tostring(freshAlerts.screen)))
+check("and its chat type is a channel rather than the no-op default, for when chat is ticked",
+    freshAlerts.chatType == "SAY", tostring(freshAlerts.chatType))
 
 -- A cast by a pet is dropped for every module that takes the default group-member
 -- filter and still delivered to the one that asked for every caster. That opt-out
@@ -2879,6 +4167,35 @@ for _, line in ipairs(nilGeometry) do
 end
 check("no widget geometry call was handed a nil",
     #nilGeometry == 0, table.concat(geometrySeen, "; "))
+
+-- The live-raid version of the check above: arguments the client would not have
+-- accepted, which the stub used to accept. The string in a region slot that started
+-- this list is invisible to a nil audit because it is not nil.
+-- Deduplicated the same way the nil list above is, because one broken anchor throws
+-- once per sweep and the interesting part of the message is the region name.
+local function unique(lines)
+    local seen, out = {}, {}
+    for _, line in ipairs(lines) do
+        if not seen[line] then
+            seen[line] = true
+            out[#out + 1] = line
+        end
+    end
+    return out
+end
+check("no widget geometry call was refused by the client's argument rules",
+    #badGeometry == 0, table.concat(unique(badGeometry), "; "))
+
+-- Everything the client runs for you on a timer - the watch list's sweep, a deferred
+-- chat send - ran here without raising. In the game each of these was an error bag.
+check("no timer or ticker callback threw",
+    #callbackErrors == 0, table.concat(unique(callbackErrors), "; "))
+
+-- Same rule for the calls this file drives by hand: a widget call that raises in the
+-- game is an error bag the player sees and the addon survives, so here it is a line in
+-- this list and the checks after it still describe the wreckage.
+check("no display or settings call the harness drove by hand threw",
+    #displayErrors == 0, table.concat(unique(displayErrors), "; "))
 
 local proxied = {}
 for _, f in ipairs(frames) do
