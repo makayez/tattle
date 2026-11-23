@@ -2486,6 +2486,25 @@ do
         token == nil and source == nil,
         tostring(token) .. " / " .. tostring(source))
 end
+-- The same "not in this group" verdict arrived at through the sanctioned comparison instead
+-- of a printed name: the client is asked whether the hidden name belongs to each member in
+-- turn and every one answers *no*. Those are answers, and they have to produce the same
+-- outcome as a readable name that matches nobody - the weaker evidence, labelled - rather
+-- than a member named as the spell's target. This is the path a name belonging to an
+-- out-of-group player takes, and it is worth separating from the refusal above: a refusal
+-- says nothing about who the name is, while these answers say who it is not.
+spellTargetNamesAreSecret = true
+resetWorld()
+fiveDeepRaid(4)
+setSpellTargetName("raid1", "Stranger")          -- secret, and matching nobody in this group
+setTarget("raid1", "raid2")
+do
+    local token, source = Tattle.CastTargetOf("raid1")
+    check("a hidden name the client matches against nobody in the group yields the labelled fallback",
+        token == "raid2" and source == "unit-target",
+        tostring(token) .. " / " .. tostring(source))
+end
+
 spellTargetNamesAreSecret = true
 
 -- A swap whose start this client never delivered: the record is built by the terminal event
@@ -4160,6 +4179,237 @@ check("the Lua-version audit read every file it claims to",
     "opened " .. luaScanned .. " of " .. #toRead)
 check("nothing here needs a Lua newer than the one CI runs",
     #luaOffenders == 0, "\n  " .. table.concat(luaOffenders, "\n  "))
+
+-- ============================================================================
+-- A build that does not have the API.
+--
+-- Everything above runs against a client that owns every API this addon asks for and
+-- answers every question cooperatively. That is the friendliest world available, and it is
+-- not the world the documentation describes: `C_SecretComparisons` is not named anywhere in
+-- the generated 12.1.5 or 12.1.7 docs, and the four cast-target APIs are two patch levels
+-- old. An addon that *assumes* an API produces a line in someone's error bag - which is
+-- literally how this release cycle opened (`Config.lua:833: attempt to call a nil value`,
+-- from a `Settings.Close` nobody had asked the client about). So each API here is taken
+-- away and the same sentence is run again, which asks two questions at once: nothing
+-- raises, and what comes back is degraded rather than optimistic.
+--
+-- These checks are only possible because the shipped code looks every one of these up at
+-- the moment it calls it. That is why the two load-time captures in Core.lua became
+-- call-time lookups on this section's account: a capture at load time cannot be exercised
+-- by a harness that loads the addon exactly once into exactly one client, and an absence
+-- nobody can test is a guard that has quietly become a comment.
+--
+-- Everything is inside one `do` block for a reason that cost a debugging round to learn:
+-- several of this file's helper functions (`alertMode`, `chatOnly`, `fiveDeepRaid`) are
+-- `local function` declarations written at indent 0 *inside the body of the
+-- `for _, moduleId in ipairs(Tattle.moduleOrder)` loop further up*, so they are invisible
+-- down here and reading them is a nil global rather than a compile error. Anything this
+-- section needs is declared locally.
+-- ============================================================================
+
+do
+    -- Nil the *globals* for the duration of one scenario - the shape a build has when it
+    -- never had the function - and put them back whatever the scenario did to them.
+    -- An array of { name, value } rather than a table keyed by name: `pairs` cannot carry an
+    -- absent global, and "absent" is most of what this section asks about.
+    local function withGlobals(entries, label, scenario)
+        local saved = {}
+        for _, entry in ipairs(entries) do
+            saved[#saved + 1] = { name = entry.name, value = _G[entry.name] }
+            _G[entry.name] = entry.value
+        end
+        local ok, err = pcall(scenario)
+        for _, slot in ipairs(saved) do _G[slot.name] = slot.value end
+        check("asking about " .. label .. " did not raise", ok, tostring(err))
+    end
+
+    local function withoutApis(names, scenario)
+        local entries = {}
+        for _, name in ipairs(names) do entries[#entries + 1] = { name = name } end
+        withGlobals(entries, "a build without " .. table.concat(names, " / "), scenario)
+    end
+
+    local function raidOfFive()
+        resetWorld()
+        setGroup({ raid = true, count = 5, selfIndex = 4 })
+    end
+
+    -- The alert routing this section needs, written out rather than borrowed: chat on the
+    -- channel under test, nothing else, so an alert either arrives in `sentMessages` or does
+    -- not and there is no screen frame to confuse the count with.
+    local function chatOnlyAlerts(moduleId, chatType)
+        local settings = TattleDB.modules[moduleId]
+        settings.enabled = true
+        settings.scope = "group"
+        settings.alerts.console = false
+        settings.alerts.chat = true
+        settings.alerts.chatType = chatType
+        settings.alerts.audio = false
+        settings.alerts.screen = false
+        table.wipe(sentMessages)
+        -- The body's own `chatOnly` gets this reset from the `resetWorld` it calls; this
+        -- section's version does not reset the world, so it clears the counter itself.
+        -- Without this line the two chat checks below measure one counter across two
+        -- scenarios, which is how "the attempt was suppressed" starts reporting the
+        -- previous scenario's attempt.
+        chatSendAttempts = 0
+    end
+
+    local function joinedAlerts()
+        local parts = {}
+        for i = 1, #sentMessages do parts[i] = tostring(sentMessages[i].message) end
+        return table.concat(parts, " | ")
+    end
+
+    -- The whole 12.1.x answer set missing. The alert must still happen - a swap nobody can
+    -- attribute is still a swap - and the weaker evidence must still be used, still labelled.
+    withoutApis({ "PlayerIsSpellTarget", "UnitIsSpellTarget", "UnitShouldDisplaySpellTargetName",
+                  "UnitSpellTargetName", "UnitSpellTargetClass" }, function()
+        raidOfFive()
+        chatOnlyAlerts("swapblaster", "YELL")
+        spellTargetNamesAreSecret = false
+        setSpellTarget("raid1", "raid5")      -- what a build carrying the API would have said
+        setTarget("raid1", "raid2")           -- whom the caster's interface is pointed at
+        local errors = {}
+        setClock(GetTime() + 60)
+        for _, err in ipairs(dispatch("UNIT_SPELLCAST_CHANNEL_START", "raid1", "guid-gone-1", 161399)) do
+            errors[#errors + 1] = err
+        end
+        setClock(GetTime() + 2)
+        for _, err in ipairs(dispatch("UNIT_SPELLCAST_CHANNEL_STOP", "raid1", "guid-gone-1", 161399)) do
+            errors[#errors + 1] = err
+        end
+        runTimers()
+        check("a cast whose target APIs do not exist is still reported",
+            messageContaining("Donut used Swapblaster") ~= nil and #errors == 0,
+            joinedAlerts() .. " ;; " .. table.concat(errors, " ;; "))
+        check("a build with no target API still uses the weaker evidence, and still calls it aiming",
+            messageContaining("aiming at Pancakes") ~= nil, joinedAlerts())
+        -- The failure this third check exists for: an implementation that reads "no API" as
+        -- "no target" and then reaches for the strongest sentence it knows anyway.
+        check("and it never claims the swap landed on somebody it was not told about",
+            messageContaining("Swapblaster on ") == nil, joinedAlerts())
+    end)
+
+    -- The two target questions are independent, and a build may carry only one of them.
+    withoutApis({ "PlayerIsSpellTarget", "UnitIsSpellTarget" }, function()
+        raidOfFive()
+        spellTargetNamesAreSecret = false
+        setSpellTarget("raid1", "raid5")
+        setTarget("raid1", "raid2")
+        local token, source = Tattle.CastTargetOf("raid1")
+        check("the name path does not depend on the is-it-me boolean",
+            token == "raid5" and source == "spell-target",
+            tostring(token) .. " / " .. tostring(source))
+    end)
+
+    -- And the other way round, which is the case that matters most: *you* were the target,
+    -- and that answer never needed a name from anybody.
+    withoutApis({ "UnitSpellTargetName", "UnitSpellTargetClass" }, function()
+        raidOfFive()
+        setSpellTarget("raid1", "player")
+        setTarget("raid1", "raid2")
+        local token, source = Tattle.CastTargetOf("raid1")
+        check("being the spell's target is answered with no name API in the build",
+            token == "player" and source == "spell-target",
+            tostring(token) .. " / " .. tostring(source))
+    end)
+
+    -- Absent and "answered no" are different facts, and this is where an implementation
+    -- could confuse them for the price of every target name on a build that has no gate.
+    withoutApis({ "UnitShouldDisplaySpellTargetName" }, function()
+        raidOfFive()
+        spellTargetNamesAreSecret = false
+        setSpellTarget("raid1", "raid5")
+        setTarget("raid1", "raid2")
+        local token, source = Tattle.CastTargetOf("raid1")
+        check("a build with no display gate is not read as a gate that answered false",
+            token == "raid5" and source == "spell-target",
+            tostring(token) .. " / " .. tostring(source))
+    end)
+
+    -- The API with the weakest claim to existing at all, asked about a name the client will
+    -- not read. Falls back to the weaker source; never invents a member.
+    withoutApis({ "C_SecretComparisons" }, function()
+        raidOfFive()
+        spellTargetNamesAreSecret = true
+        setSpellTarget("raid1", "raid5")
+        setTarget("raid1", "raid2")
+        local token, source = Tattle.CastTargetOf("raid1")
+        check("with no sanctioned comparison in the build the name stays unresolved, not guessed",
+            token == "raid2" and source == "unit-target",
+            tostring(token) .. " / " .. tostring(source))
+    end)
+
+    -- Two secrecy-detection paths, one of them a fallback. With the sanctioned predicate
+    -- missing, a hidden aura read must still be withheld rather than counted as an answered
+    -- "no aura" - the watch list's whole claim rests on that difference.
+    local silenced = { ["Neural Silencer"] = true }
+    raidOfFive()
+    silenceWho("Donut")          -- somebody who does have one, so the read has something to hide
+    secreteAuraReads()
+    local controlCarriers, controlHidden = Tattle.AuraCarrierSplit(silenced, "HELPFUL")
+    check("a protected member whose aura comes back hidden is withheld (baseline)",
+        #controlCarriers == 0 and #controlHidden == 1,
+        #controlCarriers .. " carriers, " .. #controlHidden .. " hidden")
+    withoutApis({ "canaccessvalue" }, function()
+        local carriers, hidden = Tattle.AuraCarrierSplit(silenced, "HELPFUL")
+        check("the fallback secrecy test reaches the same withheld answer",
+            #carriers == #controlCarriers and #hidden == #controlHidden and #hidden > 0,
+            #carriers .. " carriers, " .. #hidden .. " hidden")
+    end)
+
+    -- And that the fallback above is not the only thing ever consulted. The two checks so far
+    -- turn out to be *one* check if they run against a value that refuses `tostring` as well
+    -- as the predicate: then the sanctioned path and the heuristic answer alike, and deleting
+    -- the predicate's use entirely stays green (it took running the mutation to find that).
+    -- So this scenario turns the secrecy off at the aura and puts the refusal only in the
+    -- predicate - a deliberately synthetic disagreement between two client surfaces, which is
+    -- the only way to see which of the two the code actually asked.
+    aurasReturnSecrets = false
+    withGlobals({ { name = "canaccessvalue", value = function() return false end } },
+        "a predicate that refuses everything it is asked about", function()
+        local carriers, hidden = Tattle.AuraCarrierSplit(silenced, "HELPFUL")
+        check("the sanctioned secrecy predicate is asked, and obeyed, before any fallback",
+            #carriers == 0 and #hidden == 1,
+            #carriers .. " carriers, " .. #hidden .. " hidden")
+    end)
+
+    -- The rule from the other side: a build with no aura reader at all must not report an
+    -- unprotected group. Readable auras first, so the baseline proves the member shows.
+    raidOfFive()
+    silenceWho("Donut")
+    local readableCarriers, readableHidden = Tattle.AuraCarrierSplit(silenced, "HELPFUL")
+    local groupSize = #Tattle.GroupUnitTokens()
+    check("a readable protected member is named (baseline)",
+        #readableCarriers == 1 and groupSize >= 2,
+        #readableCarriers .. " carriers of " .. groupSize .. " members, " .. #readableHidden .. " hidden")
+    withoutApis({ "C_UnitAuras" }, function()
+        local carriers, hidden = Tattle.AuraCarrierSplit(silenced, "HELPFUL")
+        check("a build with no aura reader leaves every member unanswered, none unprotected",
+            #carriers == 0 and #hidden == groupSize,
+            #carriers .. " carriers, " .. #hidden .. " hidden of " .. groupSize)
+    end)
+
+    -- Chat's two gates on a build that cannot answer the first question. The permissive side
+    -- is a decision, so it is asserted as one; the printability gate is asserted to hold
+    -- without any client cooperation, which is what makes that decision safe.
+    withoutApis({ "C_ChatInfo" }, function()
+        raidOfFive()
+        chatOnlyAlerts("swapblaster", "SAY")
+        Tattle.SendAlert("Donut used Swapblaster on Maple", "swapblaster")
+        runTimers()
+        check("with no lockdown API the send is still attempted - the permissive side, on purpose",
+            chatSendAttempts == 1 and #sentMessages == 1,
+            "attempted " .. chatSendAttempts .. ", arrived " .. #sentMessages)
+        chatOnlyAlerts("swapblaster", "SAY")
+        Tattle.SendAlert(Secret.asSecret("Maple"), "swapblaster")
+        runTimers()
+        check("and the gate that does not ask the client holds without any client help",
+            chatSendAttempts == 0 and #sentMessages == 0,
+            "attempted " .. chatSendAttempts .. ", arrived " .. #sentMessages)
+    end)
+end
 
 local geometrySeen = {}
 for _, line in ipairs(nilGeometry) do

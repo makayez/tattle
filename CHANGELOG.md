@@ -2,6 +2,44 @@
 
 All notable changes to Tattle will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **A Neural Silencer aura read that the client refused could be counted as a member who is
+  protected.** `ValueIsReadable` asked the client's sanctioned secrecy predicate and then
+  threw away a `false` answer: `(pcall(...)) and answer or nil` is `nil` when the answer is
+  `false`, so "this value is not readable" was indistinguishable from "the predicate would
+  not answer", and the stringification fallback underneath got the decision instead. The
+  player-visible version is the watch list naming someone as protected on the strength of a
+  value it was not allowed to look at - the exact thing this addon's rules are written
+  against, arriving through the function whose only job is telling a refusal from an answer.
+  This is the fourth time that idiom has bitten this codebase; beta.2's entry describes the
+  previous three, and the harness only saw this one once two *different* client secrecy
+  surfaces were made to disagree with each other - against a value that refuses both, the
+  sanctioned path and the fallback answer the same way and a check cannot tell which one ran.
+
+### Hardened
+
+- **Every client API the addon asks for is now looked up at the moment it asks**, not
+  captured while the addon loaded. Two were: `C_SecretComparisons.Equal` and `canaccessvalue`
+  (and this addon's `C_UnitAuras` reads went through a file-level alias, which is a
+  load-time capture by another name). Behaviour on a client that has them is identical; what
+  changed is that their *absence* can now be tested, because a harness that loads the addon
+  once into one client cannot exercise a load-time capture at all.
+- **A harness section for builds that do not have the API**, taking away each of the four
+  12.1.x cast-target APIs, `C_SecretComparisons`, `canaccessvalue`, `C_UnitAuras` and
+  `C_ChatInfo` in turn and running the same sentences. Each one asserts two things: nothing
+  raises, and what comes back is degraded rather than confident - an alert on a build with no
+  target API still fires and still says "aiming at", never "on"; a build with no aura reader
+  leaves every member *unanswered* rather than reporting a group with nobody protected; and
+  chat's printability gate still holds on a client that cannot answer the lockdown question.
+  `C_SecretComparisons` is the one worth worrying about, since it is not named anywhere in the
+  generated 12.1.5 or 12.1.7 documentation.
+- Two checks were rewritten after mutation testing showed they could not fail: a
+  predicate-vs-fallback pair that passed with the predicate's use deleted outright, and a
+  chat-gate pair that measured one attempt counter across two scenarios. 240 -> 264 checks.
+
 ## [0.2.0-beta.2] - 2026-11-22
 
 Two things, both from the first live beta. One half is what that beta reported: two error

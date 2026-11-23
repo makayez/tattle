@@ -85,9 +85,22 @@ Tattle.DebugPrint = DebugPrint
 --   3. Where a name has to be matched against our own list and the name is
 --      secret, use the client's sanctioned comparison API if this build has one.
 
--- Present in a 11.0.7+ client; absent in older ones, where the question simply
--- cannot be asked.
-local secretEqual = (C_SecretComparisons and C_SecretComparisons.Equal) or nil
+-- Present in some 11.x/12.x clients and *not named anywhere in the 12.1.5 or 12.1.7
+-- generated documentation*, which makes its absence the likeliest missing API in this
+-- addon rather than a hypothetical one. Asked for at the moment it is needed instead of
+-- captured while the addon loaded, and that is not tidiness: a load-time capture is the
+-- one absence in this file no test can reach, because the harness loads the addon into
+-- exactly one client and never a second time. A call-time lookup lets a check take the
+-- namespace away, run the sentence that wants it, and put it back - so "this build has no
+-- sanctioned comparison" stops being a claim in a comment and becomes a path a machine has
+-- watched execute. The same reasoning covers `CanAccessValueApi` and `AuraReaderApi`
+-- below; nothing else in the shipped files captures a client API at load time.
+local function SecretComparisonApi()
+    local namespace = C_SecretComparisons
+    local equal = namespace and namespace.Equal
+    if type(equal) ~= "function" then return nil end
+    return equal
+end
 
 -- Asking "is this secret?" is itself a comparison, so the probe is the smallest
 -- one possible: a plain value is equal to itself, and the client raises when a
@@ -121,6 +134,7 @@ local function LookupInNameSet(nameSet, name) return nameSet[name] == true end
 -- because the sanctioned API is not documented as caring which side is which.
 -- true/false when this build answered, nil when it would not answer at all.
 local function SecretNameMatches(nameSet, secretName)
+    local secretEqual = SecretComparisonApi()
     if not secretEqual then return nil end
     local answered = false
     for watched in pairs(nameSet) do
@@ -752,6 +766,15 @@ local function ReadableBool(value)
     return value
 end
 
+-- A call that answered, paired with the boolean it answered with - preserving *false* as an
+-- answer. Every "did the client say no" question in this file has to keep three outcomes
+-- apart (yes / no / would not say), and `ok and ReadableBool(x) or nil` collapses the last
+-- two into one, which is how "refused" and "answered no" end up meaning the same thing.
+local function BooleanAnswer(callSucceeded, answer)
+    if not callSucceeded then return nil end
+    return ReadableBool(answer)
+end
+
 -- "Did this unit's spell target me?" 12.0.0 added this as `UnitIsSpellTarget` and
 -- the 12.1.x docs know only `PlayerIsSpellTarget`; which one a build carries is not
 -- something an addon can look up, so both spellings are tried.
@@ -808,6 +831,7 @@ Tattle.SpellTargetName = SpellTargetName
 -- which is safe here only because the caller treats "no match for anybody" as "no
 -- answer", never as "certainly not this member".
 local function ClientSaysSameName(a, b)
+    local secretEqual = SecretComparisonApi()
     if not secretEqual then return false end
     -- No type gate. Asking whether two values are secret, or what type they report, is
     -- itself an inspection of a value the addon is not allowed to inspect; the only
@@ -815,11 +839,12 @@ local function ClientSaysSameName(a, b)
     -- comes back. A value that is not comparable at all fails inside the pcall below and
     -- is reported as no answer, which is the same outcome and costs nothing.
     if a == nil or b == nil then return false end   -- nil is not a secret and never reaches the client
-    local ok, same = pcall(secretEqual, a, b)
-    local answer = ok and ReadableBool(same) or nil
+    -- `BooleanAnswer` rather than `ok and ReadableBool(same) or nil`: the idiom turns the
+    -- client's *false* into nil, and here the fallthrough happened to reach the same verdict,
+    -- which is the worst kind of correct.
+    local answer = BooleanAnswer(pcall(secretEqual, a, b))
     if answer ~= nil then return answer end
-    ok, same = pcall(secretEqual, b, a)
-    answer = ok and ReadableBool(same) or nil
+    answer = BooleanAnswer(pcall(secretEqual, b, a))
     return answer == true
 end
 
@@ -919,17 +944,29 @@ Tattle.WatcherNames = WatcherNames
 -- predicate, and otherwise by attempting the one operation that must fail for anything
 -- hidden - turning it into a string, which is exactly the thing an addon is not allowed to do
 -- with a name it was not given.
-local canAccessValue = (type(canaccessvalue) == "function") and canaccessvalue or nil
+local function CanAccessValueApi()
+    local predicate = canaccessvalue
+    if type(predicate) ~= "function" then return nil end
+    return predicate
+end
 
 local function ValueIsReadable(value)
     if value == nil then return false end
+    local canAccessValue = CanAccessValueApi()
     if canAccessValue then
         local ok, answer = pcall(canAccessValue, value)
         if ok and type(answer) == "boolean" then
-            -- The predicate's own answer can only be relied on if it is a plain boolean, so
-            -- the comparison that would tell them apart is attempted rather than assumed.
-            local plain = (pcall(function() return answer == true end)) and answer or nil
-            if plain ~= nil then return plain == true end
+            -- The predicate's answer is only usable if it is a *plain* boolean, which is
+            -- what the comparison below is for: comparing a secret boolean raises, so
+            -- reaching the return means the answer can be trusted. Written as
+            -- `(pcall(...)) and answer or nil` it looked equivalent and was not - a predicate
+            -- that answered "this value is not readable" produced `true and false or nil`,
+            -- which is nil, so the client's *refusal* was thrown away and the stringification
+            -- fallback underneath answered instead. That is this file's own documented trap,
+            -- in the function whose whole job is telling a refusal from an answer, and it made
+            -- a hidden aura count as a protected member. Caught by the harness only once two
+            -- secrecy surfaces were made to disagree with each other.
+            if pcall(function() return answer == true end) then return answer == true end
         end
     end
     return (pcall(tostring, value)) ~= false
@@ -939,11 +976,31 @@ end
 -- nameSet's spells? Two answers rather than one, because "no" and "we may not look" are
 -- different facts and the watch list has to be able to tell them apart. A call that raises
 -- is a refusal; a call that returns nothing is a real "no".
+-- The reader is fetched through a nil-safe lookup, which is not what the call below looks
+-- like: `pcall(C_UnitAuras.GetAuraDataBySpellName, ...)` protects the *call*, but indexing
+-- `C_UnitAuras` to get the function happens while building the argument list, outside any
+-- protection - so a build without that namespace raises before `pcall` ever runs. Same for
+-- a namespace that appears later in a session. `C_UnitAuras` is inside the interface range
+-- this addon's TOC declares, so this is not a live-risk fix; it is what lets a check take
+-- the aura reader away and confirm that every member comes back *unanswered* - "hidden by
+-- the client" - instead of "nobody protected".
+local function AuraReaderApi()
+    -- `_G`, not this file's `local C_UnitAuras` upvalue: an upvalue is a load-time capture
+    -- by another name, and the point of this lookup is that a check can take the namespace
+    -- away mid-session and watch the answers change to "nobody answered".
+    local namespace = _G.C_UnitAuras
+    local reader = namespace and namespace.GetAuraDataBySpellName
+    if type(reader) ~= "function" then return nil end
+    return reader
+end
+
 local function AuraReadOutcome(unitToken, nameSet, auraFilter)
     local answered, has = false, false
     if not unitToken or not nameSet then return false, false end
+    local reader = AuraReaderApi()
+    if not reader then return false, false end   -- not "no aura": nobody answered
     for spellName in pairs(nameSet) do
-        local ok, aura = pcall(C_UnitAuras.GetAuraDataBySpellName, unitToken, spellName, auraFilter or "HELPFUL")
+        local ok, aura = pcall(reader, unitToken, spellName, auraFilter or "HELPFUL")
         if not ok then
             -- Refused outright. Not this member's answer, so nothing is recorded either way
             -- and the caller sees `answered == false`.
